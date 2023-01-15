@@ -39,7 +39,6 @@ class SyncScheduler:
             self._sync_gpus()
 
             for step, dev_no, batch_no in step_sched:
-                print(step, dev_no, batch_no)
                 if step == Step.IDLE:
                     continue
 

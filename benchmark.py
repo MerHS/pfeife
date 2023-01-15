@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from datetime import datetime
 from functools import partial
 
 import torch
@@ -9,19 +10,31 @@ import torch._dynamo as dynamo
 from pfeife import run_master, PipeManager
 from pfeife.utils import get_logger
 from test.utils import get_model, timed
+from torch.profiler import profile, ProfilerActivity
 
 log = get_logger()
 
+now = datetime.now()
+current_time = now.strftime("%y%m%d-%H%M%S")
+dir_path = os.path.dirname(os.path.realpath(__file__))
+result_path = f"{dir_path}/result/pipe-test-{current_time}"
 
-class DummyOptimizer:
-    def __init__(self, *args, **kwargs):
-        pass
 
-    def zero_grad(self):
-        pass
-
-    def step(self):
-        pass
+def profile_model(model_iter_fn, model, inputs):
+    print(f"save to: {result_path}")
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=0, warmup=2, active=3),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            result_path, worker_name="worker0"
+        ),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    ) as prof:
+        for i in range(5):
+            model_iter_fn(model, inputs)
+            prof.step()
 
 
 def run_model(args, model, inputs):
@@ -68,10 +81,15 @@ def run_model(args, model, inputs):
     pipe.train()
 
     # warmup
-    _ = timed(pipe, model_iter_fn, inputs, times=3, return_result=False)
-    t_total = timed(pipe, model_iter_fn, inputs, times=args.repeat, return_result=False)
+    if args.profile:
+        profile_model(model_iter_fn, pipe, inputs)
+    else:
+        _ = timed(pipe, model_iter_fn, inputs, times=3, return_result=False)
+        t_total = timed(
+            pipe, model_iter_fn, inputs, times=args.repeat, return_result=False
+        )
 
-    print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
+        print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
 
 
 if __name__ == "__main__":
@@ -81,6 +99,7 @@ if __name__ == "__main__":
         default="eager",
         help="if set to a str, uses dynamo[str] backend. else, eager",
     )
+    parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--pipe_split", type=int, default=2)
