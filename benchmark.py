@@ -24,13 +24,6 @@ class DummyOptimizer:
         pass
 
 
-def model_iter_fn(model, example_inputs, collect_outputs=False):
-    outputs = model.run(*example_inputs)
-
-    if collect_outputs:
-        return outputs
-
-
 def run_model(args, model, inputs):
     # def move_tensor(maybe_tensor):
     #     if torch.is_tensor(maybe_tensor):
@@ -41,7 +34,7 @@ def run_model(args, model, inputs):
     dynamo.reset()
     if args.verbose:
         dynamo.config.verbose = True
-        dynamo.config.log_level = logging.INFO
+        dynamo.config.log_level = logging.DEBUG
         log.setLevel(logging.INFO)
 
     backend = args.backend
@@ -55,16 +48,30 @@ def run_model(args, model, inputs):
 
         backend = print_compile
 
-    pipe = PipeManager(model, backend)
+    def model_iter_fn(model, example_inputs, collect_outputs=False):
+        target = torch.rand(args.batch_size, 10)
+        outputs = model.run(target, *example_inputs)
+
+        if collect_outputs:
+            return outputs
+
+    def loss_fn(pred, target):
+        return pred.sum()
+
+    pipe = PipeManager(
+        model,
+        loss_fn=loss_fn,
+        dynamo_backend=backend,
+        pipe_split=args.pipe_split,
+        batch_split=args.batch_split,
+    )
     pipe.train()
 
     # warmup
     _ = timed(pipe, model_iter_fn, inputs, times=3, return_result=False)
     t_total = timed(pipe, model_iter_fn, inputs, times=args.repeat, return_result=False)
 
-    print(
-        f"model: {model_name} / mean latency {t_total / args.repeat} across {args.repeat} runs"
-    )
+    print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
 
 
 if __name__ == "__main__":
@@ -77,11 +84,11 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--pipe_split", type=int, default=2)
+    parser.add_argument("--batch_split", type=int, default=4)
     parser.add_argument("--repeat", default=5, type=int, help="Repeats for timing run")
     parser.add_argument(
         "--model",
         default="timm_vision_transformer",
-        type=int,
         help="name of torchbench model, e.g. hf_Bert",
     )
 
@@ -91,7 +98,8 @@ if __name__ == "__main__":
 
     print(f"================ run {model_name} ================")
 
-    model, inputs = get_model(args)
-    print(f"shape: {inputs[0].shape}")
+    model, inputs = get_model(args.model, args.batch_size)
+    print(f"input shape: {inputs[0].shape}")
+    args.batch_size = inputs[0].shape[0]
 
     run_master(run_model, (args, model, inputs), pipe_split=args.pipe_split)

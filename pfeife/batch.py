@@ -24,7 +24,7 @@ def shard_dict_of_args(args_dict, batch_spilt):
 
         sharded_arg_flat = []
 
-        for v in zip(flat):
+        for v in flat:
             if torch.is_tensor(v):
                 # TODO: do not force split first dimension
                 chunk_tensors = torch.tensor_split(v, batch_spilt, 0)

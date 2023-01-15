@@ -33,7 +33,10 @@ def run_local(rank, main_fn, args, pipe_split):
 
     if rank == 0:
         rpc.init_rpc(
-            f"worker_{rank}", rank=rank, world_size=world_size, rpc_backend_options=options
+            f"worker_{rank}",
+            rank=rank,
+            world_size=world_size,
+            rpc_backend_options=options,
         )
         main_fn(*args)
     else:

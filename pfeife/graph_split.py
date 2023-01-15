@@ -8,6 +8,7 @@ from torch.fx.graph_module import GraphModule
 
 from .utils import get_logger
 
+
 @dataclass
 class Bucket:
     size: int = 0
@@ -17,14 +18,20 @@ class Bucket:
     # param_ids is just used for unit testing
     param_ids: List = field(default_factory=list)
 
+
 class GraphSplitter:
     def split(self, gm: GraphModule):
         raise NotImplementedError()
+
 
 class ParamSplit(GraphSplitter):
     def __init__(self, split_cnt=2):
         super().__init__()
         self.split_cnt = split_cnt
+
+    def _ignore_parameter(self, parameter):
+        # TODO: handle it. What's this for?
+        return hasattr(parameter, "_ddp_ignored") and parameter._ddp_ignored
 
     def split(self, gm: GraphModule):
         total_bytes = 0
@@ -51,7 +58,7 @@ class ParamSplit(GraphSplitter):
         for node in gm.graph.nodes:
             if node.op in ("output", "placeholder"):
                 continue
-            
+
             buck = buckets[len(buckets) - 1]
 
             if buck.size >= bucket_bytes and len(buckets) < split_cnt:

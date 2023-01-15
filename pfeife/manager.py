@@ -13,12 +13,12 @@ from torch._dynamo.optimizations import BACKENDS
 from torch._inductor.compile_fx import compile_fx
 
 from torch._subclasses import UnsupportedFakeTensorException
-from torch.utils._pytree import tree_flatten, tree_map
+from torch.utils._pytree import tree_flatten
 
 from .graph_split import ParamSplit
 from .utils import get_logger
 from .batch import send_value, split_args_kwargs
-from .trace import Trace
+from .trace import graph_break, StepTrace
 from .scheduler import SchedGPipe, Sched1F1B
 
 log = get_logger()
@@ -55,16 +55,6 @@ def fake_mode_from_tensors(inputs: List[Any]):
 def deepcopy_to_fake_tensor(obj, fake_mode):
     with torch._subclasses.fake_tensor.FakeCopyMode(fake_mode):
         return wrap_fake_exception(lambda: copy.deepcopy(obj))
-
-
-def graph_break(value, device):
-    def tensor_map(v):
-        if torch.is_tensor(v):
-            return v.detach().to(device).requires_grad_(True)
-        else:
-            return v
-
-    return tree_map(tensor_map, value)
 
 
 class SubmodCompiler(torch.fx.interpreter.Interpreter):
@@ -149,6 +139,9 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
             # maybe this isn't sound in general, but only changing the target of a node might be ok?
             if n.op == "call_module":
                 idx = self.submodule_idx
+
+                # TODO: set next_device
+                device_max = self.manager.pipe_split
                 device = f"cuda:{idx}"
                 next_device = f"cuda:{idx+1}"
 
@@ -179,17 +172,18 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
                 self.module.add_submodule(n.target, compiled_submod_real)
 
                 # break graph
-                send_arg = Node(
-                    arg.graph,
-                    f"{n.name}_sent",
-                    "call_function",
-                    graph_break,
-                    (n, next_device),
-                    dict(),
-                )
-                n.replace_all_uses_with(send_arg)
-                send_arg.args = (n, next_device)
-                n.append(send_arg)
+                if device_max > idx + 1:
+                    send_arg = Node(
+                        n.graph,
+                        f"{n.name}_sent",
+                        "call_function",
+                        graph_break,
+                        (n, next_device),
+                        dict(),
+                    )
+                    n.replace_all_uses_with(send_arg)
+                    send_arg.args = (n, next_device)
+                    n.append(send_arg)
 
                 self.submodule_idx += 1
                 return curr_submod(*new_args, **kwargs)
@@ -205,15 +199,14 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
             return getattr(self, n.op)(n.target, new_args, kwargs)
 
 
-class PipeRunner(nn.Module):
-    def __init__(self, manager: "PipeManager", gm: fx.GraphModule):
+class TraceGenerator(nn.Module):
+    def __init__(self, gm: fx.GraphModule):
         super().__init__()
-        self.manager = manager
         self.gm = gm
 
     def forward(self, *args, **kwargs):
-        trace = Trace(args, kwargs, self.gm)
-        return trace
+        trace = StepTrace(args, kwargs, self.gm)
+        return [trace]
 
 
 class PipeManager:
@@ -232,8 +225,10 @@ class PipeManager:
         self.orig_model = model
         self.pipe_split = pipe_split
         self.batch_split = batch_split
-        self.sched_cls = Sched1F1B if scheduler == "1f1b" else SchedGPipe
         self.loss_fn = loss_fn
+
+        sched_cls = Sched1F1B if scheduler == "1f1b" else SchedGPipe
+        self.sched = sched_cls(device_cnt=pipe_split, batch_cnt=batch_split)
 
         if type(dynamo_backend) == str:
             if dynamo_backend == "inductor":
@@ -270,10 +265,11 @@ class PipeManager:
             log.info(
                 "\n---final graph---\n" + str(split_gm.graph) + "\n---------------\n"
             )
+            print(split_gm.graph)
 
-            self.runner = PipeRunner(self, split_gm)
+            trace_gen = TraceGenerator(split_gm)
 
-            return self.runner
+            return trace_gen
 
         def pipeline_compiler(
             gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]
@@ -302,15 +298,26 @@ class PipeManager:
         args = send_value(args, "cuda:0")
         kwargs = send_value(kwargs, "cuda:0")
 
-        args, kwargs = split_args_kwargs(args, kwargs)
-        targets, _ = split_args_kwargs([target], dict())
+        def pmap(v):
+            if torch.is_tensor(v):
+                return v.shape
+            else:
+                return v
 
-        traces: List[Trace] = []
-        for micro_args, micro_kwargs, micro_target in zip(args, kwargs, target):
-            traces.append(self.opt_model(micro_args, micro_kwargs))
+        # TODO: check last device
+        target = send_value(target, f"cuda:{self.pipe_split - 1}")
 
-        sched = self.sched_cls(traces, self.pipe_split, self.batch_split)
+        args, kwargs = split_args_kwargs(args, kwargs, self.batch_split)
+        targets, _ = split_args_kwargs([target], dict(), self.batch_split)
 
-        loss = sched.exec(targets, self.loss_fn)
+        traces: List[StepTrace] = []
+        for micro_args, micro_kwargs in zip(args, kwargs):
+            traces.append(self.opt_model(*micro_args, **micro_kwargs))
+
+        # returns losses
+        losses = self.sched.exec(traces, targets, self.loss_fn)
+        loss = sum([l for l in losses if torch.is_tensor(l)])
+
+        self.optimizer.step()
 
         return loss
