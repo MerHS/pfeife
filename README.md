@@ -16,5 +16,5 @@ python install.py
 cd ../pfeife
 
 ## Single benchmark (ViT-L, pipelined with aot_eager compiler)
-python dynamo/distributed.py --torchbench_model timm_vision_transformer_large --batch_size 4 --pipe --dynamo aot_eager
+python benchmark.py --model timm_vision_transformer_large --batch_size 4 --backend aot_eager
 ```
