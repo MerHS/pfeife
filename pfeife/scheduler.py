@@ -33,29 +33,24 @@ class SyncScheduler:
 
     def exec(self, traces: List[StepTrace], targets: List[Any], loss_fn):
         losses = []
+        futures = []
 
         for step_sched in self.sched:
             # TODO: async run by RPC
             self._sync_gpus()
 
             for step, dev_no, batch_no in step_sched:
+                print(step, dev_no, batch_no)
                 if step == Step.IDLE:
                     continue
 
                 curr_trace = traces[batch_no]
 
                 if step == Step.FORWARD:
-                    curr_trace.forward_step()
-                    if dev_no + 1 >= self.device_cnt:
-                        loss = curr_trace.calc_loss(targets[batch_no], loss_fn)
-                        losses.append(loss)
-                    else:
-                        curr_trace.forward_send(f"cuda:{dev_no+1}")
+                    curr_trace.forward_step(batch_no)
 
                 elif step == Step.BACKWARD:
-                    curr_trace.backward_step()
-                    if dev_no > 0:
-                        curr_trace.backward_grad_send(f"cuda:{dev_no-1}")
+                    curr_trace.backward_step(batch_no)
 
         return losses
 

@@ -7,18 +7,16 @@ import torch.fx as fx
 import torch.optim as optim
 from torch.fx import Node
 import torch.fx.traceback as fx_traceback
+import torch.distributed.rpc as rpc
 
 import torch._dynamo as dynamo
-from torch._dynamo.optimizations import BACKENDS
-from torch._inductor.compile_fx import compile_fx
-
 from torch._subclasses import UnsupportedFakeTensorException
 from torch.utils._pytree import tree_flatten
 
 from .graph_split import ParamSplit
 from .utils import get_logger
 from .batch import send_value, split_args_kwargs
-from .trace import graph_break, StepTrace
+from .trace import graph_break, StepTrace, RPCStage, RPCProxyModule
 from .scheduler import SchedGPipe, Sched1F1B
 
 log = get_logger()
@@ -66,44 +64,6 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
         self.submodule_idx = 0
         self.fake_mode = fake_mode
 
-    def compile_submod(self, submod, args, kwargs):
-        """
-        Compile the submodule,
-        using a wrapper to make sure its output is always a tuple,
-        which is required by AotAutograd based compilers
-        """
-        assert len(kwargs) == 0, "We assume only args for these modules"
-
-        class WrapperModule(torch.nn.Module):
-            def __init__(self, compiled_submod, unwrap_singleton_tuple):
-                super().__init__()
-                self.compiled_submod = compiled_submod
-                self.unwrap_singleton_tuple = unwrap_singleton_tuple
-
-            def forward(self, *args):
-                x = self.compiled_submod(*args)
-                # TODO(whc)
-                # for some reason the isinstance check is necessary if I split one node per submod
-                # - even though I supposedly wrapped the output in a tuple in those cases, the real
-                # compiled module was still returning a tensor
-                if self.unwrap_singleton_tuple and isinstance(x, (tuple, list)):
-                    return x[0]
-                return x
-
-        unwrap_singleton_tuple = False
-        for sn in submod.graph.nodes:
-            if sn.op == "output":
-                if not isinstance(sn.args[0], tuple):
-                    unwrap_singleton_tuple = True
-                    sn.args = (sn.args,)
-        submod.recompile()
-
-        wrapper = WrapperModule(
-            self.compiler(submod, args),
-            unwrap_singleton_tuple,
-        )
-        return wrapper
-
     # Note:
     #
     # The way distributed works today around fake tensors can be somehwat confusing.
@@ -147,7 +107,7 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
 
                 for arg in args:
                     if torch.is_tensor(arg):
-                        arg = arg.to(device)
+                        arg = arg.to("cpu")
 
                     if isinstance(arg, torch.Tensor) and not isinstance(
                         arg, torch._subclasses.FakeTensor
@@ -157,19 +117,19 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
                         new_args.append(arg)
 
                 real_mod = self.fetch_attr(n.target)
-                real_mod = real_mod.to(device)
+                real_mod = real_mod.to("cpu")
 
                 if fake_mode:
                     curr_submod = deepcopy_to_fake_tensor(real_mod, fake_mode)
                 else:
                     curr_submod = real_mod
 
-                compiled_submod_real = self.compile_submod(real_mod, new_args, kwargs)
-                compiled_submod_real = compiled_submod_real.to(device)
+                stage = self.manager.add_stage(idx, real_mod, self.compiler)
+                stage_mod = RPCProxyModule(stage)
 
                 self.module.delete_submodule(n.target)
                 n.target = "compiled_" + n.target
-                self.module.add_submodule(n.target, compiled_submod_real)
+                self.module.add_submodule(n.target, stage_mod)
 
                 # break graph
                 if device_max > idx + 1:
@@ -200,12 +160,13 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
 
 
 class TraceGenerator(nn.Module):
-    def __init__(self, gm: fx.GraphModule):
+    def __init__(self, manager: "PipeManager", gm: fx.GraphModule):
         super().__init__()
+        self.manager = manager
         self.gm = gm
 
     def forward(self, *args, **kwargs):
-        trace = StepTrace(args, kwargs, self.gm)
+        trace = StepTrace(args, kwargs, self.gm, self.manager.rpc_stages)
         return [trace]
 
 
@@ -230,17 +191,11 @@ class PipeManager:
         sched_cls = Sched1F1B if scheduler == "1f1b" else SchedGPipe
         self.sched = sched_cls(device_cnt=pipe_split, batch_cnt=batch_split)
 
-        if type(dynamo_backend) == str:
-            if dynamo_backend == "inductor":
-                torch._inductor.config.triton.cudagraphs = False
-                dynamo_backend = compile_fx
-            else:
-                dynamo_backend = BACKENDS[dynamo_backend]
-
         self.splitter = (
             ParamSplit(pipe_split) if graph_splitter is None else graph_splitter
         )
         self.dynamo_backend = dynamo_backend
+        self.rpc_stages = []
 
         self._compile()
 
@@ -267,7 +222,7 @@ class PipeManager:
             )
             print(split_gm.graph)
 
-            trace_gen = TraceGenerator(split_gm)
+            trace_gen = TraceGenerator(self, split_gm)
 
             return trace_gen
 
@@ -278,6 +233,11 @@ class PipeManager:
 
         dynamo_ctx = dynamo.optimize(pipeline_compiler)
         self.opt_model = dynamo_ctx(self.orig_model)
+
+    def add_stage(self, idx, stage_mod, compiler):
+        stage = rpc.remote(f"worker_{idx+1}", RPCStage, args=(idx, stage_mod, compiler))
+        self.rpc_stages.append(stage)
+        return stage
 
     def train(self):
         self.opt_model.train()
@@ -291,6 +251,9 @@ class PipeManager:
         2. forward & backward & optimizer step
         3. return loss
         """
+
+        for stage in self.rpc_stages:
+            stage.rpc_sync().reset_cache()
 
         self.optimizer.zero_grad()
 

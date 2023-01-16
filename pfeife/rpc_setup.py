@@ -15,7 +15,7 @@ def run_master(main_fn, args, *, pipe_split=2):
     os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", "localhost")
     os.environ["MASTER_PORT"] = os.getenv("MASTER_PORT", "12355")
 
-    world_size = pipe_split
+    world_size = pipe_split + 1
 
     mp.spawn(run_local, args=(main_fn, args, pipe_split), nprocs=world_size, join=True)
 
@@ -23,7 +23,7 @@ def run_master(main_fn, args, *, pipe_split=2):
 def run_local(rank, main_fn, args, pipe_split):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=512)
 
-    world_size = pipe_split
+    world_size = pipe_split + 1
 
     # TODO: for DDP
     # backend = "nccl" if args.cuda else "gloo"
@@ -33,7 +33,7 @@ def run_local(rank, main_fn, args, pipe_split):
 
     if rank == 0:
         rpc.init_rpc(
-            f"worker_{rank}",
+            f"master",
             rank=rank,
             world_size=world_size,
             rpc_backend_options=options,

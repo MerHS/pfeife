@@ -1,3 +1,4 @@
+import threading
 from typing import Callable, Optional, List
 from inspect import Signature, Parameter
 
@@ -6,25 +7,31 @@ import torch.fx as fx
 from torch.fx import Node
 from torch.utils._pytree import tree_flatten, tree_map
 
+from torch._dynamo.optimizations import BACKENDS
+from torch._inductor.compile_fx import compile_fx
+
 
 def graph_break(value, device):
-    def tensor_map(v):
-        if torch.is_tensor(v):
-            # return v.to(device)
-            return v.detach().to(device).requires_grad_(True).clone()
-        else:
-            return v
+    # def tensor_map(v):
+    #     if torch.is_tensor(v):
+    #         # return v.to(device)
+    #         return v.detach().to(device).requires_grad_(True).clone()
+    #     else:
+    #         return v
 
-    return tree_map(tensor_map, value)
+    # return tree_map(tensor_map, value)
+    return value
 
 
 class TraceInterpreter(fx.Interpreter):
-    def __init__(self, module, args, kwargs):
+    def __init__(self, module, args, kwargs, rpc_stages):
         super().__init__(module)
         self.pc = 0
         self.env = {}
         self.node_list = list(self.module.graph.nodes)
-        self.target_device = "cuda:0"
+        self.rpc_stages = rpc_stages
+        self.curr_batch = 0
+        self.curr_stage = 0
 
         # process args and kwargs
         parameters = []
@@ -44,13 +51,20 @@ class TraceInterpreter(fx.Interpreter):
         self.args_iter = iter(self.args)
         self.last_leaf = None
 
-    def run_until(self, predicate: Callable[[Node], bool]) -> Optional[Node]:
+    def run_until(
+        self, predicate: Callable[[Node], bool], curr_batch
+    ) -> Optional[Node]:
         result = None
+        ignore_this = True
+        self.curr_batch = curr_batch
+
         while self.pc < len(self.node_list):
             node = self.node_list[self.pc]
 
-            if predicate(node):
+            if not ignore_this and predicate(node):
                 return result
+
+            ignore_this = False
 
             result = self.run_node(node)
 
@@ -69,69 +83,168 @@ class TraceInterpreter(fx.Interpreter):
         if target == graph_break:
             value, device = args
 
-            def tensor_detach(v):
-                if torch.is_tensor(v):
-                    return v.detach().to(self.target_device).requires_grad_(True)
+            # value is future
+            def tensor_wait(v):
+                if isinstance(v, torch.futures.Future):
+                    return v.wait()
                 else:
                     return v
 
-            def tensor_clone(v):
-                if torch.is_tensor(v):
-                    return v.clone()
-                else:
-                    return v
-
-            leaf = tree_map(tensor_detach, value)
-            self.last_leaf = leaf
-
-            return tree_map(tensor_clone, leaf)
+            return tree_map(tensor_wait, value)
 
         return target(*args, **kwargs)
+
+    def call_module(self, target, args, kwargs):
+        stage = self.rpc_stages[self.curr_stage]
+
+        args = [a.cpu() for a in args]
+
+        result = stage.rpc_async().forward(self.curr_batch, *args)
+        self.curr_stage += 1
+
+        return result
+
+
+class RPCProxyModule(torch.nn.Module):
+    def __init__(self, stage_ref):
+        super().__init__()
+        self.stage_ref = stage_ref
+
+    def forward(self, *args):
+        # NOOP
+        return args
+
+
+class WrapperModule(torch.nn.Module):
+    def __init__(self, compiled_submod, unwrap_singleton_tuple):
+        super().__init__()
+        self.compiled_submod = compiled_submod
+        self.unwrap_singleton_tuple = unwrap_singleton_tuple
+
+    def forward(self, *args):
+        x = self.compiled_submod(*args)
+        # TODO(whc)
+        # for some reason the isinstance check is necessary if I split one node per submod
+        # - even though I supposedly wrapped the output in a tuple in those cases, the real
+        # compiled module was still returning a tensor
+        if self.unwrap_singleton_tuple and isinstance(x, (tuple, list)):
+            return x[0]
+        return x
+
+
+class RPCStage:
+    # TODO: stage_no-based, not rank
+    def __init__(self, rank, stage_mod, compiler):
+        # TODO: should we use lock?
+        self.lock = threading.Lock()
+        self.rank = rank
+        self.device = f"cuda:{rank}"
+        self.stage_mod = stage_mod.to(self.device)
+        self.is_compiled = False
+        self.compiler = compiler
+
+        if type(compiler) == str:
+            if compiler == "inductor":
+                torch._inductor.config.triton.cudagraphs = False
+                self.compiler = compile_fx
+            else:
+                self.compiler = BACKENDS[compiler]
+
+        self.reset_cache()
+
+    def reset_cache(self):
+        self.fw_results = dict()
+        self.fw_inputs = dict()
+
+    def compile_submod(self, args):
+        def to_device(v):
+            if torch.is_tensor(v):
+                return v.to(self.device)
+            else:
+                return v
+
+        args = tree_map(to_device, args)
+        submod = self.stage_mod
+
+        unwrap_singleton_tuple = False
+        for sn in submod.graph.nodes:
+            if sn.op == "output":
+                if not isinstance(sn.args[0], tuple):
+                    unwrap_singleton_tuple = True
+                    sn.args = (sn.args,)
+        submod.recompile()
+
+        wrapper = WrapperModule(
+            self.compiler(submod, args),
+            unwrap_singleton_tuple,
+        )
+
+        self.stage_mod = wrapper
+
+    def forward(self, batch_no, *args):
+        if self.rank == 0:
+            args = [a.to(self.device) for a in args]
+        else:
+            fw_args = [a.detach().to(self.device).requires_grad_(True) for a in args]
+            self.fw_inputs[batch_no] = fw_args
+            args = [a.clone() for a in fw_args]
+
+        with self.lock:
+            if not self.is_compiled:
+                self.compile_submod(args)
+                self.is_compiled = True
+            result = self.stage_mod(*args)
+            self.fw_results[batch_no] = result
+
+        result_cpu = [r.detach().cpu() for r in result]
+
+        return result_cpu
+
+    def backward(self, batch_no, grads):
+        grads = [a.to(self.device) for a in grads]
+
+        with self.lock:
+            torch.autograd.backward(self.fw_results[batch_no], grads)
+
+        next_grads = []
+
+        if self.rank != 0:
+            back_input = self.fw_inputs[batch_no]
+            next_grads = [g.grad.cpu() for g in back_input]
+
+        return next_grads
+
+    def backward_last(self, batch_no, target, loss_fn):
+        res = self.fw_results[batch_no][0]
+        target = target.to(self.device)
+
+        with self.lock:
+            loss = loss_fn(res, target)
+            torch.autograd.backward(loss, None)
+
+        next_grads = []
+        if self.rank != 0:
+            back_input = self.fw_inputs[batch_no]
+            next_grads = [g.grad.cpu() for g in back_input]
+
+        return next_grads
 
 
 class StepTrace:
     """
     Save the result of each submodule for backward
     # TODO: use rpc
+    # TODO: find grad from a u-net like model
     """
 
-    def __init__(self, init_args, init_kwargs, gm: fx.GraphModule):
-        self.gm = gm
-        self.interpreter = TraceInterpreter(gm, init_args, init_kwargs)
-        self.forward_results = []
-        self.forward_sents = []
-        self.last_result = None
-        self.last_grad = None
+    def __init__(self, init_args, init_kwargs, gm: fx.GraphModule, rpc_stages):
+        self.interpreter = TraceInterpreter(gm, init_args, init_kwargs, rpc_stages)
+        self.rpc_stages = rpc_stages
 
-    def forward_step(self):
-        result = self.interpreter.run_until(lambda n: n.target == graph_break)
-        self.forward_results.append(result)
-        self.last_result = result
+    def forward_step(self, batch_no):
+        result = self.interpreter.run_until(lambda n: n.target == graph_break, batch_no)
         return result
 
-    def forward_send(self, device):
-        self.interpreter.target_device = device
-        sent = self.interpreter.run_next()
-
-        self.forward_sents.append(self.interpreter.last_leaf)
-        self.last_result = sent
-        return sent
-
-    def calc_loss(self, target, loss_fn):
-        loss = loss_fn(self.last_result[0], target)
-        self.forward_results[len(self.forward_results) - 1] = loss
-        return loss
-
-    def backward_step(self):
-        last_result = self.forward_results.pop()
-        torch.autograd.backward(last_result, grad_tensors=self.last_grad)
-
-    def backward_grad_send(self, device):
-        def map_grad(v):
-            if torch.is_tensor(v) and v.requires_grad:
-                return v.grad.to(device)
-            else:
-                return None
-
-        grads = tree_map(map_grad, self.forward_sents.pop())
-        self.last_grad = grads
+    def backward_step(self, batch_no):
+        # torch.autograd.backward(last_result, grad_tensors=self.last_grad)
+        pass

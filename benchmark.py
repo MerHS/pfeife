@@ -26,7 +26,7 @@ def profile_model(model_iter_fn, model, inputs):
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=0, warmup=2, active=3),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            result_path, worker_name="worker0"
+            result_path, worker_name="worker_1"
         ),
         record_shapes=True,
         profile_memory=True,
