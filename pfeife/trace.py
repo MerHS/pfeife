@@ -4,11 +4,16 @@ from inspect import Signature, Parameter
 
 import torch
 import torch.fx as fx
+import torch.optim as optim
 from torch.fx import Node
-from torch.utils._pytree import tree_flatten, tree_map
+from torch.distributed.rpc import PyRRef
 
 from torch._dynamo.optimizations import BACKENDS
 from torch._inductor.compile_fx import compile_fx
+from torch.utils._pytree import tree_flatten, tree_map
+
+
+from .utils import to_device
 
 
 def graph_break(value, device):
@@ -24,14 +29,14 @@ def graph_break(value, device):
 
 
 class TraceInterpreter(fx.Interpreter):
-    def __init__(self, module, args, kwargs, rpc_stages):
+    def __init__(self, module, args, kwargs, rpc_stages, batch_no):
         super().__init__(module)
         self.pc = 0
         self.env = {}
         self.node_list = list(self.module.graph.nodes)
         self.rpc_stages = rpc_stages
-        self.curr_batch = 0
         self.curr_stage = 0
+        self.batch_no = batch_no
 
         # process args and kwargs
         parameters = []
@@ -51,12 +56,9 @@ class TraceInterpreter(fx.Interpreter):
         self.args_iter = iter(self.args)
         self.last_leaf = None
 
-    def run_until(
-        self, predicate: Callable[[Node], bool], curr_batch
-    ) -> Optional[Node]:
+    def run_until(self, predicate: Callable[[Node], bool]) -> Optional[Node]:
         result = None
         ignore_this = True
-        self.curr_batch = curr_batch
 
         while self.pc < len(self.node_list):
             node = self.node_list[self.pc]
@@ -99,20 +101,10 @@ class TraceInterpreter(fx.Interpreter):
 
         args = [a.cpu() for a in args]
 
-        result = stage.rpc_async().forward(self.curr_batch, *args)
+        result = stage.rpc_async().forward(self.batch_no, *args)
         self.curr_stage += 1
 
         return result
-
-
-class RPCProxyModule(torch.nn.Module):
-    def __init__(self, stage_ref):
-        super().__init__()
-        self.stage_ref = stage_ref
-
-    def forward(self, *args):
-        # NOOP
-        return args
 
 
 class WrapperModule(torch.nn.Module):
@@ -134,7 +126,7 @@ class WrapperModule(torch.nn.Module):
 
 class RPCStage:
     # TODO: stage_no-based, not rank
-    def __init__(self, rank, stage_mod, compiler):
+    def __init__(self, rank, stage_mod, compiler, optimizer):
         # TODO: should we use lock?
         self.lock = threading.Lock()
         self.rank = rank
@@ -149,6 +141,10 @@ class RPCStage:
                 self.compiler = compile_fx
             else:
                 self.compiler = BACKENDS[compiler]
+
+        # TODO: Learning Rate
+        optimizer_cls = optim.Adam if optimizer == "adam" else optim.SGD
+        self.optimizer = optimizer_cls(self.stage_mod.parameters())
 
         self.reset_cache()
 
@@ -200,8 +196,19 @@ class RPCStage:
 
         return result_cpu
 
+    def forward_loss(self, batch_no, target, loss_fn):
+        with self.lock:
+            last_result = self.fw_results[batch_no]
+            loss = loss_fn(last_result, target)
+            self.fw_results[batch_no] = loss
+
+        loss_cpu = loss.detach().cpu()
+
+        return loss_cpu
+
     def backward(self, batch_no, grads):
-        grads = [a.to(self.device) for a in grads]
+        if grads is not None:
+            grads = [a.to(self.device) for a in grads]
 
         with self.lock:
             torch.autograd.backward(self.fw_results[batch_no], grads)
@@ -214,37 +221,54 @@ class RPCStage:
 
         return next_grads
 
-    def backward_last(self, batch_no, target, loss_fn):
-        res = self.fw_results[batch_no][0]
-        target = target.to(self.device)
+    def optimizer_zero_grad(self):
+        self.optimizer.zero_grad()
 
-        with self.lock:
-            loss = loss_fn(res, target)
-            torch.autograd.backward(loss, None)
-
-        next_grads = []
-        if self.rank != 0:
-            back_input = self.fw_inputs[batch_no]
-            next_grads = [g.grad.cpu() for g in back_input]
-
-        return next_grads
+    def optimizer_step(self):
+        self.optimizer.step()
 
 
 class StepTrace:
     """
     Save the result of each submodule for backward
-    # TODO: use rpc
     # TODO: find grad from a u-net like model
     """
 
-    def __init__(self, init_args, init_kwargs, gm: fx.GraphModule, rpc_stages):
-        self.interpreter = TraceInterpreter(gm, init_args, init_kwargs, rpc_stages)
-        self.rpc_stages = rpc_stages
+    def __init__(self, interpreter: TraceInterpreter):
+        self.interpreter = interpreter
+        self.rpc_stages = self.interpreter.rpc_stages
+        self.back_stage = len(self.rpc_stages) - 1
+        self.batch_no = self.interpreter.batch_no
+        self.last_grads = None
+        self.last_step = None
 
-    def forward_step(self, batch_no):
-        result = self.interpreter.run_until(lambda n: n.target == graph_break, batch_no)
-        return result
+    def forward_step(self):
+        if self.last_step is not None:
+            self.last_step.wait()
 
-    def backward_step(self, batch_no):
-        # torch.autograd.backward(last_result, grad_tensors=self.last_grad)
-        pass
+        self.last_step = self.interpreter.run_until(lambda n: n.target == graph_break)
+
+    def forward_loss(self, target, loss_fn):
+        if self.last_step is not None:
+            for v in self.last_step:
+                v.wait()
+
+        target = to_device(target, "cpu")
+        loss = (
+            self.rpc_stages[self.back_stage]
+            .rpc_async()
+            .forward_loss(self.batch_no, target, loss_fn)
+        )
+
+        return loss
+
+    def backward_step(self):
+        grads = self.last_grads
+        grads = grads.wait() if grads is not None else grads
+
+        self.last_grads = (
+            self.rpc_stages[self.back_stage].rpc_async().backward(self.batch_no, grads)
+        )
+        self.back_stage -= 1
+
+        return self.last_grads

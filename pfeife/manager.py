@@ -1,4 +1,4 @@
-from typing import List, Any
+from typing import List, Any, Union
 import copy
 
 import torch
@@ -12,12 +12,15 @@ import torch.distributed.rpc as rpc
 import torch._dynamo as dynamo
 from torch._subclasses import UnsupportedFakeTensorException
 from torch.utils._pytree import tree_flatten
+from torch.nn.modules.loss import _Loss
+
 
 from .graph_split import ParamSplit
 from .utils import get_logger
 from .batch import send_value, split_args_kwargs
-from .trace import graph_break, StepTrace, RPCStage, RPCProxyModule
+from .trace import graph_break, StepTrace, RPCStage, TraceInterpreter
 from .scheduler import SchedGPipe, Sched1F1B
+from .loss import LossWrapper
 
 log = get_logger()
 
@@ -53,6 +56,10 @@ def fake_mode_from_tensors(inputs: List[Any]):
 def deepcopy_to_fake_tensor(obj, fake_mode):
     with torch._subclasses.fake_tensor.FakeCopyMode(fake_mode):
         return wrap_fake_exception(lambda: copy.deepcopy(obj))
+
+
+class EmptyModule(torch.nn.Module):
+    pass
 
 
 class SubmodCompiler(torch.fx.interpreter.Interpreter):
@@ -124,8 +131,8 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
                 else:
                     curr_submod = real_mod
 
-                stage = self.manager.add_stage(idx, real_mod, self.compiler)
-                stage_mod = RPCProxyModule(stage)
+                self.manager.add_stage(idx, real_mod, self.compiler)
+                stage_mod = EmptyModule()
 
                 self.module.delete_submodule(n.target)
                 n.target = "compiled_" + n.target
@@ -166,7 +173,11 @@ class TraceGenerator(nn.Module):
         self.gm = gm
 
     def forward(self, *args, **kwargs):
-        trace = StepTrace(args, kwargs, self.gm, self.manager.rpc_stages)
+        batch_no = self.manager.get_batch_no()
+        interpreter = TraceInterpreter(
+            self.gm, args, kwargs, self.manager.rpc_stages, batch_no
+        )
+        trace = StepTrace(interpreter)
         return [trace]
 
 
@@ -174,7 +185,7 @@ class PipeManager:
     def __init__(
         self,
         model,
-        loss_fn,
+        loss_fn: Union[_Loss, LossWrapper],
         optimizer="adam",
         dynamo_backend="aot_eager",
         scheduler="gpipe",
@@ -196,12 +207,12 @@ class PipeManager:
         )
         self.dynamo_backend = dynamo_backend
         self.rpc_stages = []
+        self.last_batch_no = 0
 
         self._compile()
 
         # TODO: late initialize optimizer after dynamo compilation?
-        optimizer_cls = optim.Adam if optimizer == "adam" else optimizer
-        self.optimizer = optimizer_cls(self.opt_model.parameters())
+        self.optimizer_cls = optimizer
 
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
@@ -209,7 +220,94 @@ class PipeManager:
             if fake_mode is None:
                 fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
 
-            split_gm = self.splitter.split(gm)
+            qualname_map = {}
+            split_gm = self.splitter.split(gm, qualname_map)
+
+            def delete_user_reference(node, user, delete_node=True):
+                assert len(user.kwargs) == 0
+                use_idxs = [i for i, arg in enumerate(user.args) if arg == node]
+                assert len(use_idxs) == 1
+                args_copy = list(user.args)
+                args_copy.pop(use_idxs[0])
+                user.args = tuple(args_copy)
+                if delete_node:
+                    node.graph.erase_node(node)
+
+                return use_idxs[0]
+
+            def move_param_to_callee(root, callee_name, param_val, use_idx, is_buffer):
+                assert isinstance(param_val, torch.Tensor), (
+                    f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}."
+                    + (
+                        f" It might happen if module '{node.target}' was passed to some 'leaf function'"
+                        f"(see https://pytorch.org/docs/stable/fx.html#pippy.fx.wrap). Please inspect "
+                        f"usages of '{node.target}' in the traced graph."
+                        if isinstance(param_val, torch.nn.Module)
+                        else ""
+                    )
+                )
+                callee = root.get_submodule(callee_name)
+                new_param_name = f"moved_{node.target.replace('.', '_')}"
+                assert not hasattr(
+                    callee, new_param_name
+                ), f"Module {callee_name} already has a parameter named {new_param_name}"
+                if is_buffer:
+                    callee.register_buffer(new_param_name, param_val)
+                else:
+                    setattr(callee, new_param_name, param_val)
+
+                # Update qualname mapping
+                # New qualname will have submodule prefix
+                new_qualname = f"{callee_name}.{new_param_name}"
+                if node.target in qualname_map:
+                    # Just in case the target name is already in the qualname_map
+                    # returned by split_module() -- we update the mapping using the
+                    # new name as a new key
+                    qualname_map[new_qualname] = qualname_map.pop(node.target)
+                else:
+                    qualname_map[new_qualname] = node.target
+
+                ph_counter = 0
+                for sn in callee.graph.nodes:
+                    if sn.op == "placeholder":
+                        if ph_counter == use_idx:
+                            with callee.graph.inserting_before(sn):
+                                get_attr = callee.graph.get_attr(new_param_name)
+                                sn.replace_all_uses_with(get_attr)
+                                callee.graph.erase_node(sn)
+                        ph_counter += 1
+                callee.graph.lint()
+                callee.recompile()
+
+                return get_attr
+
+            to_delete = list()  # a list of nodes for deferral deletion
+
+            for node in split_gm.graph.nodes:
+                if node.op == "get_attr" and len(node.users) == 1:
+                    user = list(node.users)[0]
+                    assert user.op == "call_module"
+                    use_idx = delete_user_reference(node, user)
+
+                    # Move parameter into submodule and replace PH with a get_attr
+                    atoms = node.target.split(".")
+                    mod_itr = split_gm
+                    for atom in atoms[:-1]:
+                        mod_itr = getattr(mod_itr, atom)
+                    param_val = getattr(mod_itr, atoms[-1])
+                    is_buffer = atoms[-1] in mod_itr._buffers
+
+                    move_param_to_callee(
+                        split_gm, user.target, param_val, use_idx, is_buffer
+                    )
+
+                    to_delete.append((mod_itr, atoms))
+
+            # deferral deletion
+            for (mod_itr, atoms) in to_delete:
+                delattr(mod_itr, atoms[-1])
+
+            split_gm.recompile()
 
             submod_compiler = SubmodCompiler(
                 self, split_gm, self.dynamo_backend, fake_mode
@@ -226,16 +324,23 @@ class PipeManager:
 
             return trace_gen
 
-        def pipeline_compiler(
-            gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]
-        ):
-            return compile_fn(gm, example_inputs)
-
-        dynamo_ctx = dynamo.optimize(pipeline_compiler)
+        dynamo_ctx = dynamo.optimize(compile_fn)
         self.opt_model = dynamo_ctx(self.orig_model)
 
+    def reset_batch_no(self):
+        self.batch_no_last = 0
+
+    def get_batch_no(self):
+        no = self.batch_no_last
+        self.batch_no_last += 1
+        return no
+
     def add_stage(self, idx, stage_mod, compiler):
-        stage = rpc.remote(f"worker_{idx+1}", RPCStage, args=(idx, stage_mod, compiler))
+        stage = rpc.remote(
+            f"worker_{idx+1}",
+            RPCStage,
+            args=(idx, stage_mod, compiler, self.optimizer_cls),
+        )
         self.rpc_stages.append(stage)
         return stage
 
@@ -244,6 +349,14 @@ class PipeManager:
 
     def eval(self):
         self.opt_model.eval()
+
+    def optimizer_zero_grad(self):
+        for stage in self.rpc_stages:
+            stage.rpc_sync().optimizer_zero_grad()
+
+    def optimizer_step(self):
+        for stage in self.rpc_stages:
+            stage.rpc_sync().optimizer_step()
 
     def run(self, target, *args, **kwargs):
         """
@@ -255,17 +368,12 @@ class PipeManager:
         for stage in self.rpc_stages:
             stage.rpc_sync().reset_cache()
 
-        self.optimizer.zero_grad()
+        self.reset_batch_no()
+        self.optimizer_zero_grad()
 
         # TODO: should we move args to gpu 0 before splitting?
         args = send_value(args, "cuda:0")
         kwargs = send_value(kwargs, "cuda:0")
-
-        def pmap(v):
-            if torch.is_tensor(v):
-                return v.shape
-            else:
-                return v
 
         # TODO: check last device
         target = send_value(target, f"cuda:{self.pipe_split - 1}")
@@ -281,6 +389,6 @@ class PipeManager:
         losses = self.sched.exec(traces, targets, self.loss_fn)
         loss = sum([l for l in losses if torch.is_tensor(l)])
 
-        self.optimizer.step()
+        self.optimizer_step()
 
         return loss

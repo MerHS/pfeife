@@ -9,6 +9,8 @@ import torch._dynamo as dynamo
 
 from pfeife import run_master, PipeManager
 from pfeife.utils import get_logger
+from pfeife.loss import SumLoss
+
 from test.utils import get_model, timed
 from torch.profiler import profile, ProfilerActivity
 
@@ -68,12 +70,9 @@ def run_model(args, model, inputs):
         if collect_outputs:
             return outputs
 
-    def loss_fn(pred, target):
-        return pred.sum()
-
     pipe = PipeManager(
         model,
-        loss_fn=loss_fn,
+        loss_fn=SumLoss(),
         dynamo_backend=backend,
         pipe_split=args.pipe_split,
         batch_split=args.batch_split,

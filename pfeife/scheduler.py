@@ -32,8 +32,8 @@ class SyncScheduler:
         raise NotImplementedError()
 
     def exec(self, traces: List[StepTrace], targets: List[Any], loss_fn):
-        losses = []
-        futures = []
+        losses = [None for _ in traces]
+        futures = [None for _ in traces]
 
         for step_sched in self.sched:
             # TODO: async run by RPC
@@ -47,10 +47,20 @@ class SyncScheduler:
                 curr_trace = traces[batch_no]
 
                 if step == Step.FORWARD:
-                    curr_trace.forward_step(batch_no)
+                    curr_trace.forward_step()
+                    if dev_no == self.device_cnt - 1:
+                        losses[batch_no] = curr_trace.forward_loss(
+                            targets[batch_no], loss_fn
+                        )
 
                 elif step == Step.BACKWARD:
-                    curr_trace.backward_step(batch_no)
+                    if dev_no == self.device_cnt - 1:
+                        loss = losses[batch_no].wait()
+                        losses[batch_no] = loss
+                    futures[batch_no] = curr_trace.backward_step()
+
+        for f in futures:
+            f.wait()
 
         return losses
 
@@ -90,7 +100,7 @@ class SchedGPipe(SyncScheduler):
             for post_idle in range(rng[1], device_cnt):
                 step_sched.append((Step.IDLE, post_idle, -1))
 
-            forward_sched.append(step_sched)
+            forward_sched.append(list(reversed(step_sched)))
 
         # backward
         sched.extend(forward_sched)
