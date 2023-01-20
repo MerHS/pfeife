@@ -1,4 +1,4 @@
-from typing import List, Any
+from typing import List, Any, Union
 import copy
 
 import torch
@@ -7,19 +7,20 @@ import torch.fx as fx
 import torch.optim as optim
 from torch.fx import Node
 import torch.fx.traceback as fx_traceback
+import torch.distributed.rpc as rpc
 
 import torch._dynamo as dynamo
-from torch._dynamo.optimizations import BACKENDS
-from torch._inductor.compile_fx import compile_fx
-
 from torch._subclasses import UnsupportedFakeTensorException
 from torch.utils._pytree import tree_flatten
+from torch.nn.modules.loss import _Loss
+
 
 from .graph_split import ParamSplit
 from .utils import get_logger
 from .batch import send_value, split_args_kwargs
-from .trace import graph_break, StepTrace
+from .trace import graph_break, StepTrace, RPCStage, TraceInterpreter
 from .scheduler import SchedGPipe, Sched1F1B
+from .loss import LossWrapper
 
 log = get_logger()
 
@@ -57,6 +58,10 @@ def deepcopy_to_fake_tensor(obj, fake_mode):
         return wrap_fake_exception(lambda: copy.deepcopy(obj))
 
 
+class EmptyModule(torch.nn.Module):
+    pass
+
+
 class SubmodCompiler(torch.fx.interpreter.Interpreter):
     # compile each of the partitioned submodules using the user-provided compiler
     def __init__(self, manager: "PipeManager", module, compiler, fake_mode):
@@ -65,44 +70,6 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
         self.compiler = compiler
         self.submodule_idx = 0
         self.fake_mode = fake_mode
-
-    def compile_submod(self, submod, args, kwargs):
-        """
-        Compile the submodule,
-        using a wrapper to make sure its output is always a tuple,
-        which is required by AotAutograd based compilers
-        """
-        assert len(kwargs) == 0, "We assume only args for these modules"
-
-        class WrapperModule(torch.nn.Module):
-            def __init__(self, compiled_submod, unwrap_singleton_tuple):
-                super().__init__()
-                self.compiled_submod = compiled_submod
-                self.unwrap_singleton_tuple = unwrap_singleton_tuple
-
-            def forward(self, *args):
-                x = self.compiled_submod(*args)
-                # TODO(whc)
-                # for some reason the isinstance check is necessary if I split one node per submod
-                # - even though I supposedly wrapped the output in a tuple in those cases, the real
-                # compiled module was still returning a tensor
-                if self.unwrap_singleton_tuple and isinstance(x, (tuple, list)):
-                    return x[0]
-                return x
-
-        unwrap_singleton_tuple = False
-        for sn in submod.graph.nodes:
-            if sn.op == "output":
-                if not isinstance(sn.args[0], tuple):
-                    unwrap_singleton_tuple = True
-                    sn.args = (sn.args,)
-        submod.recompile()
-
-        wrapper = WrapperModule(
-            self.compiler(submod, args),
-            unwrap_singleton_tuple,
-        )
-        return wrapper
 
     # Note:
     #
@@ -147,7 +114,7 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
 
                 for arg in args:
                     if torch.is_tensor(arg):
-                        arg = arg.to(device)
+                        arg = arg.to("cpu")
 
                     if isinstance(arg, torch.Tensor) and not isinstance(
                         arg, torch._subclasses.FakeTensor
@@ -157,19 +124,19 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
                         new_args.append(arg)
 
                 real_mod = self.fetch_attr(n.target)
-                real_mod = real_mod.to(device)
+                real_mod = real_mod.to("cpu")
 
                 if fake_mode:
                     curr_submod = deepcopy_to_fake_tensor(real_mod, fake_mode)
                 else:
                     curr_submod = real_mod
 
-                compiled_submod_real = self.compile_submod(real_mod, new_args, kwargs)
-                compiled_submod_real = compiled_submod_real.to(device)
+                self.manager.add_stage(idx, real_mod, self.compiler)
+                stage_mod = EmptyModule()
 
                 self.module.delete_submodule(n.target)
                 n.target = "compiled_" + n.target
-                self.module.add_submodule(n.target, compiled_submod_real)
+                self.module.add_submodule(n.target, stage_mod)
 
                 # break graph
                 if device_max > idx + 1:
@@ -200,12 +167,17 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
 
 
 class TraceGenerator(nn.Module):
-    def __init__(self, gm: fx.GraphModule):
+    def __init__(self, manager: "PipeManager", gm: fx.GraphModule):
         super().__init__()
+        self.manager = manager
         self.gm = gm
 
     def forward(self, *args, **kwargs):
-        trace = StepTrace(args, kwargs, self.gm)
+        batch_no = self.manager.get_batch_no()
+        interpreter = TraceInterpreter(
+            self.gm, args, kwargs, self.manager.rpc_stages, batch_no
+        )
+        trace = StepTrace(interpreter)
         return [trace]
 
 
@@ -213,7 +185,7 @@ class PipeManager:
     def __init__(
         self,
         model,
-        loss_fn,
+        loss_fn: Union[_Loss, LossWrapper],
         optimizer="adam",
         dynamo_backend="aot_eager",
         scheduler="gpipe",
@@ -230,23 +202,17 @@ class PipeManager:
         sched_cls = Sched1F1B if scheduler == "1f1b" else SchedGPipe
         self.sched = sched_cls(device_cnt=pipe_split, batch_cnt=batch_split)
 
-        if type(dynamo_backend) == str:
-            if dynamo_backend == "inductor":
-                torch._inductor.config.triton.cudagraphs = False
-                dynamo_backend = compile_fx
-            else:
-                dynamo_backend = BACKENDS[dynamo_backend]
-
         self.splitter = (
             ParamSplit(pipe_split) if graph_splitter is None else graph_splitter
         )
         self.dynamo_backend = dynamo_backend
+        self.rpc_stages = []
+        self.last_batch_no = 0
 
         self._compile()
 
         # TODO: late initialize optimizer after dynamo compilation?
-        optimizer_cls = optim.Adam if optimizer == "adam" else optimizer
-        self.optimizer = optimizer_cls(self.opt_model.parameters())
+        self.optimizer_cls = optimizer
 
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
@@ -254,7 +220,94 @@ class PipeManager:
             if fake_mode is None:
                 fake_mode = torch._subclasses.fake_tensor.FakeTensorMode()
 
-            split_gm = self.splitter.split(gm)
+            qualname_map = {}
+            split_gm = self.splitter.split(gm, qualname_map)
+
+            def delete_user_reference(node, user, delete_node=True):
+                assert len(user.kwargs) == 0
+                use_idxs = [i for i, arg in enumerate(user.args) if arg == node]
+                assert len(use_idxs) == 1
+                args_copy = list(user.args)
+                args_copy.pop(use_idxs[0])
+                user.args = tuple(args_copy)
+                if delete_node:
+                    node.graph.erase_node(node)
+
+                return use_idxs[0]
+
+            def move_param_to_callee(root, callee_name, param_val, use_idx, is_buffer):
+                assert isinstance(param_val, torch.Tensor), (
+                    f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}."
+                    + (
+                        f" It might happen if module '{node.target}' was passed to some 'leaf function'"
+                        f"(see https://pytorch.org/docs/stable/fx.html#pippy.fx.wrap). Please inspect "
+                        f"usages of '{node.target}' in the traced graph."
+                        if isinstance(param_val, torch.nn.Module)
+                        else ""
+                    )
+                )
+                callee = root.get_submodule(callee_name)
+                new_param_name = f"moved_{node.target.replace('.', '_')}"
+                assert not hasattr(
+                    callee, new_param_name
+                ), f"Module {callee_name} already has a parameter named {new_param_name}"
+                if is_buffer:
+                    callee.register_buffer(new_param_name, param_val)
+                else:
+                    setattr(callee, new_param_name, param_val)
+
+                # Update qualname mapping
+                # New qualname will have submodule prefix
+                new_qualname = f"{callee_name}.{new_param_name}"
+                if node.target in qualname_map:
+                    # Just in case the target name is already in the qualname_map
+                    # returned by split_module() -- we update the mapping using the
+                    # new name as a new key
+                    qualname_map[new_qualname] = qualname_map.pop(node.target)
+                else:
+                    qualname_map[new_qualname] = node.target
+
+                ph_counter = 0
+                for sn in callee.graph.nodes:
+                    if sn.op == "placeholder":
+                        if ph_counter == use_idx:
+                            with callee.graph.inserting_before(sn):
+                                get_attr = callee.graph.get_attr(new_param_name)
+                                sn.replace_all_uses_with(get_attr)
+                                callee.graph.erase_node(sn)
+                        ph_counter += 1
+                callee.graph.lint()
+                callee.recompile()
+
+                return get_attr
+
+            to_delete = list()  # a list of nodes for deferral deletion
+
+            for node in split_gm.graph.nodes:
+                if node.op == "get_attr" and len(node.users) == 1:
+                    user = list(node.users)[0]
+                    assert user.op == "call_module"
+                    use_idx = delete_user_reference(node, user)
+
+                    # Move parameter into submodule and replace PH with a get_attr
+                    atoms = node.target.split(".")
+                    mod_itr = split_gm
+                    for atom in atoms[:-1]:
+                        mod_itr = getattr(mod_itr, atom)
+                    param_val = getattr(mod_itr, atoms[-1])
+                    is_buffer = atoms[-1] in mod_itr._buffers
+
+                    move_param_to_callee(
+                        split_gm, user.target, param_val, use_idx, is_buffer
+                    )
+
+                    to_delete.append((mod_itr, atoms))
+
+            # deferral deletion
+            for (mod_itr, atoms) in to_delete:
+                delattr(mod_itr, atoms[-1])
+
+            split_gm.recompile()
 
             submod_compiler = SubmodCompiler(
                 self, split_gm, self.dynamo_backend, fake_mode
@@ -267,23 +320,43 @@ class PipeManager:
             )
             print(split_gm.graph)
 
-            trace_gen = TraceGenerator(split_gm)
+            trace_gen = TraceGenerator(self, split_gm)
 
             return trace_gen
 
-        def pipeline_compiler(
-            gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]
-        ):
-            return compile_fn(gm, example_inputs)
-
-        dynamo_ctx = dynamo.optimize(pipeline_compiler)
+        dynamo_ctx = dynamo.optimize(compile_fn)
         self.opt_model = dynamo_ctx(self.orig_model)
+
+    def reset_batch_no(self):
+        self.batch_no_last = 0
+
+    def get_batch_no(self):
+        no = self.batch_no_last
+        self.batch_no_last += 1
+        return no
+
+    def add_stage(self, idx, stage_mod, compiler):
+        stage = rpc.remote(
+            f"worker_{idx+1}",
+            RPCStage,
+            args=(idx, stage_mod, compiler, self.optimizer_cls),
+        )
+        self.rpc_stages.append(stage)
+        return stage
 
     def train(self):
         self.opt_model.train()
 
     def eval(self):
         self.opt_model.eval()
+
+    def optimizer_zero_grad(self):
+        for stage in self.rpc_stages:
+            stage.rpc_sync().optimizer_zero_grad()
+
+    def optimizer_step(self):
+        for stage in self.rpc_stages:
+            stage.rpc_sync().optimizer_step()
 
     def run(self, target, *args, **kwargs):
         """
@@ -292,17 +365,15 @@ class PipeManager:
         3. return loss
         """
 
-        self.optimizer.zero_grad()
+        for stage in self.rpc_stages:
+            stage.rpc_sync().reset_cache()
+
+        self.reset_batch_no()
+        self.optimizer_zero_grad()
 
         # TODO: should we move args to gpu 0 before splitting?
         args = send_value(args, "cuda:0")
         kwargs = send_value(kwargs, "cuda:0")
-
-        def pmap(v):
-            if torch.is_tensor(v):
-                return v.shape
-            else:
-                return v
 
         # TODO: check last device
         target = send_value(target, f"cuda:{self.pipe_split - 1}")
@@ -318,6 +389,6 @@ class PipeManager:
         losses = self.sched.exec(traces, targets, self.loss_fn)
         loss = sum([l for l in losses if torch.is_tensor(l)])
 
-        self.optimizer.step()
+        self.optimizer_step()
 
         return loss

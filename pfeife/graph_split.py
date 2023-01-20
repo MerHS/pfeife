@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 import logging
 
 import torch
@@ -20,7 +20,7 @@ class Bucket:
 
 
 class GraphSplitter:
-    def split(self, gm: GraphModule):
+    def split(self, gm: GraphModule, qualname_map: Dict[str, str] = {}):
         raise NotImplementedError()
 
 
@@ -33,7 +33,7 @@ class ParamSplit(GraphSplitter):
         # TODO: handle it. What's this for?
         return hasattr(parameter, "_ddp_ignored") and parameter._ddp_ignored
 
-    def split(self, gm: GraphModule):
+    def split(self, gm: GraphModule, qualname_map: Dict[str, str] = {}):
         total_bytes = 0
         split_cnt = self.split_cnt
 
@@ -96,7 +96,7 @@ class ParamSplit(GraphSplitter):
                 partition_map[node] = idx
 
         split_gm = fx.passes.split_module.split_module(
-            gm, None, lambda node: partition_map[node]
+            gm, None, lambda node: partition_map[node], qualname_map
         )
 
         log = get_logger()

@@ -9,6 +9,8 @@ import torch._dynamo as dynamo
 
 from pfeife import run_master, PipeManager
 from pfeife.utils import get_logger
+from pfeife.loss import SumLoss
+
 from test.utils import get_model, timed
 from torch.profiler import profile, ProfilerActivity
 
@@ -26,7 +28,7 @@ def profile_model(model_iter_fn, model, inputs):
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=0, warmup=2, active=3),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            result_path, worker_name="worker0"
+            result_path, worker_name="worker_1"
         ),
         record_shapes=True,
         profile_memory=True,
@@ -68,12 +70,9 @@ def run_model(args, model, inputs):
         if collect_outputs:
             return outputs
 
-    def loss_fn(pred, target):
-        return pred.sum()
-
     pipe = PipeManager(
         model,
-        loss_fn=loss_fn,
+        loss_fn=SumLoss(),
         dynamo_backend=backend,
         pipe_split=args.pipe_split,
         batch_split=args.batch_split,
