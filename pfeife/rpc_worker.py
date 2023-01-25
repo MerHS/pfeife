@@ -1,0 +1,2 @@
+class RPCWorker:
+    pass
