@@ -74,10 +74,10 @@ class RPCWorker:
     def set_scheduler_steps(self, steps: List[Step]):
         self.steps = steps
 
-    def set_input(self, input_value):
+    def set_input(self, batch_id, input_value):
         self.input = input_value
 
-    def set_output(self, output_value):
+    def set_output(self, batch_id, output_value):
         self.output = output_value
 
     def set_loss_fn(self, loss_fn):

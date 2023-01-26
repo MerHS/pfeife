@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torch.distributed as dist
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
@@ -38,6 +39,9 @@ def run_local(rank, main_fn, args, pipe_split):
             world_size=world_size,
             rpc_backend_options=options,
         )
+        dist.init_process_group(
+            "nccl", world_size=world_size, rank=rank, group="master"
+        )
         main_fn(*args)
     else:
         rpc.init_rpc(
@@ -45,6 +49,9 @@ def run_local(rank, main_fn, args, pipe_split):
             rank=rank,
             world_size=world_size,
             rpc_backend_options=options,
+        )
+        dist.init_process_group(
+            "nccl", world_size=world_size, rank=rank, group="worker"
         )
 
     rpc.shutdown()

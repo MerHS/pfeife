@@ -2,6 +2,7 @@ from typing import List, Dict
 import operator
 
 import torch
+import torch.nn as nn
 from torch.fx import GraphModule, Node
 from torch.distributed.rpc import PyRRef
 from .rpc_worker import RPCWorker
