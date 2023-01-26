@@ -1,14 +1,15 @@
 from typing import List, Dict
-import operator 
+import operator
 
 import torch
 from torch.fx import GraphModule, Node
 from torch.distributed.rpc import PyRRef
 from .rpc_worker import RPCWorker
 
+
 class PipeNode:
-    def __init__(self, idx: int):
-        self.idx = idx
+    def __init__(self, rank: int):
+        self.rank = rank  # 0: master/io, 1+: worker
         self.in_edges: List["PipeEdge"] = []
         self.out_edges: List["PipeEdge"] = []
         self.device = "cpu"
@@ -31,55 +32,102 @@ class PipeNode:
     def set_device(self, device: str):
         self.device = device
 
-class PipeInput(PipeNode):
+
+class PipeIO(PipeNode):
     pass
+
 
 class PipeWorker(PipeNode):
-    def __init__(self, idx, worker: RPCWorker):
-        super().__init__(idx)
+    def __init__(self, rank: int, worker=None):
+        super().__init__(rank)
         self.worker = worker
 
-class PipeOutput(PipeNode):
-    pass
+    def set_worker(self, worker: RPCWorker):
+        self.worker = worker
+
 
 class PipeEdge:
-    def __init__(self, start_node: PipeNode, item_idx = None):
+    def __init__(self, start_node: PipeNode, item_idx=None):
         self.start_node = start_node
-        self.end_node = None
-        self.idx = item_idx # None: no getitem / int: getitem(idx)
+        self.end_nodes: List[PipeNode] = []
+        self.idx = item_idx  # None: no getitem / int: getitem(idx)
 
-    def connect(self, end_node: PipeNode):
-        self.end_node = end_node
+    def connect(self, node: PipeNode):
+        self.end_nodes.append(node)
 
 
 class PipeGraph:
-    def __init__(self, gm: GraphModule, rpc_workers: List[PyRRef]):
+    def __init__(self, rpc_workers: List[PyRRef], gm: GraphModule = None):
+        self.worker_cnt = len(rpc_workers)
         self.workers = rpc_workers
-        self.input_node = PipeInput(0)
-        self.output_node = PipeOutput(len(gm.graph.nodes) - 1)
-        self.nodes: List[PipeNode] = [self.input_node] # topo-sorted list of nodes
+
+        if gm is not None:
+            self.build_graph(gm)
+
+    def build_graph(self, gm: GraphModule):
+        self.input_node = PipeIO(0)
+        self.output_node = PipeIO(0)
+        self.internal_nodes: List[PipeWorker] = []  # topo-sorted list of nodes
         self.node_dict: Dict[str, PipeNode] = dict()
         self.edge_dict: Dict[str, PipeEdge] = dict()
 
+        node_cnt = 0
+        input_cnt = 0
         for node in gm.graph.nodes:
             node: Node
-            if node.op == "placeholder": # input 
-                self.node_dict[node.name] = node
-            elif node.op == "call_module": # worker
-                pass # TODO
-            elif node.op == "call_function" and node.target == operator.getitem: # getitem
+            if node.op == "placeholder":  # input
+                edge = PipeEdge(self.input_node, input_cnt)
+                input_cnt += 1
+                self.edge_dict[node.name] = edge
+                self.output_node.append_out(edge)
+            elif node.op == "call_module":  # worker
+                node_cnt += 1
+                rank = (node_cnt // self.worker_cnt) + 1
+                worker = PipeWorker(rank)
+
+                self.internal_nodes.append(worker)
+                self.node_dict[node.name] = worker
+                for idx, arg in enumerate(node.args):
+                    if arg.name in self.node_dict:
+                        in_node = self.node_dict[arg.name]
+                        edge = PipeEdge(in_node)
+                        edge.connect(worker)
+                        worker.append_in(edge, idx)
+                        in_node.append_out(edge)
+                    elif arg.name in self.edge_dict:
+                        edge = self.edge_dict[arg.name]
+                        edge.connect(worker)
+                        worker.append_in(edge, idx)
+                    else:
+                        print(
+                            f"cannot handle input argument {in_node.name} of node {node.name}"
+                        )
+            elif (
+                node.op == "call_function" and node.target == operator.getitem
+            ):  # getitem
                 src = node.args[0]
                 idx = node.args[1]
-                assert (src.name in self.node_dict)
+                assert src.name in self.node_dict
                 src_node = self.node_dict[src.name]
                 edge = PipeEdge(src_node, idx)
-                src_node.append_out(edge, idx)
+                src_node.append_out(edge)
                 self.edge_dict[node.name] = edge
             elif node.op == "output":
-                pass # TODO
-            else: 
+                for idx, arg in enumerate(node.args):
+                    if arg.name in self.node_dict:
+                        in_node = self.node_dict[arg.name]
+                        edge = PipeEdge(in_node)
+                        edge.connect(self.output_node)
+                        self.output_node.append_in(edge, idx)
+                        in_node.append_out(edge)
+                    elif arg.name in self.edge_dict:
+                        edge = self.edge_dict[arg.name]
+                        edge.connect(self.output_node)
+                        self.output_node.append_in(edge, idx)
+                    else:
+                        print(f"cannot handle output node {arg.name}")
+            else:
                 print(f"cannot handle {node.op} from PipeGraph")
 
-        self.nodes.append(self.output_node)
-
-
+        self.input_node.rank = self.internal_nodes[0].rank
+        self.output_node.rank = self.internal_nodes[-1].rank

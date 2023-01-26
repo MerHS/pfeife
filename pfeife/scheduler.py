@@ -1,169 +1,124 @@
 from typing import List, Any, Tuple
 from enum import Enum
+from dataclass import dataclass
 
 import torch
 
 from .trace import StepTrace
+from .pipe_graph import PipeGraph
 
 
-class Step(Enum):
-    IDLE = 1
-    FORWARD = 2
-    BACKWARD = 3
-    OPTIMIZER_STEP = 4
-    # TODO: do we need send/recv/ddp_sync?
+class StepWork(Enum):
+    # if the sendee is an output node,
+    # 1) send the result to output_node.rank if the current rank differs to the output node or,
+    # 2) save the result to the output buffer
+    SEND_ACT = 1
+    RECV_ACT = 2
+    FORWARD = 3
+    SEND_GRAD = 4
+
+    # receive output from another rank (if exists) and calculate loss if the source of grad is the output node
+    RECV_GRAD = 5
+    BACKWARD = 6
+    OPTIMIZER_STEP = 7
 
 
-class SyncScheduler:
+@dataclass
+class Step:
+    work: StepWork
+    node_id: int
+    batch_id: int
+
+
+class Scheduler:
     """
     Default Synchronous scheduler
     """
 
-    def __init__(self, device_cnt: int, batch_cnt: int):
-        self.device_cnt = device_cnt
+    def __init__(self, batch_cnt: int, graph: PipeGraph):
         self.batch_cnt = batch_cnt
-        self.sched = self.get_sched()
+        self.graph = graph
+        self.cluster, self.sched = self._build_sched()
 
-    def _sync_gpus(self):
-        for device_id in range(self.device_cnt):
-            torch.cuda.synchronize(f"cuda:{device_id}")
-
-    def get_sched(self):
+    def _build_sched(self):
+        # returns (worker_id: idx list of assigned node, worker_id: List[Step])
         raise NotImplementedError()
 
-    def exec(self, traces: List[StepTrace], targets: List[Any], loss_fn):
-        losses = [None for _ in traces]
-        futures = [None for _ in traces]
+    def assign_steps_to_workers(self, modules: List[torch.nn.Module]):
+        rank_clusters = self.cluster
 
-        for step_sched in self.sched:
-            # TODO: async run by RPC
-            self._sync_gpus()
+        devices = []
+        for worker_id, cluster in rank_clusters:
+            worker = self.graph.workers[worker_id]
+            worker_device = worker.rpc_sync().get_device()
+            devices.append(worker_device)
 
-            for step, dev_no, batch_no in step_sched:
-                print(step, dev_no, batch_no)
-                if step == Step.IDLE:
-                    continue
+            for node_id in cluster:
+                node = self.graph.internal_nodes[node_id]
+                node.device = worker_device
 
-                curr_trace = traces[batch_no]
+        input_node = self.graph.input_node
+        input_node.device = devices[input_node.rank - 1]
+        output_node = self.graph.output_node
+        output_node.device = devices[output_node.rank - 1]
 
-                if step == Step.FORWARD:
-                    curr_trace.forward_step()
-                    if dev_no == self.device_cnt - 1:
-                        losses[batch_no] = curr_trace.forward_loss(
-                            targets[batch_no], loss_fn
-                        )
+        for worker_id, (worker, cluster) in enumerate(
+            zip(self.graph.workers, rank_clusters)
+        ):
+            worker.rpc_sync().set_graph(self.graph)
+            worker.rpc_sync().set_scheduler_steps(self.get_steps(worker_id))
+            for mod_id in cluster:
+                module = modules[mod_id]
+                worker.rpc_sync().set_module(mod_id, module)
 
-                elif step == Step.BACKWARD:
-                    if dev_no == self.device_cnt - 1:
-                        loss = losses[batch_no].wait()
-                        losses[batch_no] = loss
-                    futures[batch_no] = curr_trace.backward_step()
-
-        for f in futures:
-            f.wait()
-
-        return losses
+    def get_steps(self, worker_id: int) -> List[Step]:
+        if worker_id >= len(self.sched):
+            return []
+        return self.sched[worker_id]
 
 
-class SchedGPipe(SyncScheduler):
-    def __init__(self, device_cnt: int, batch_cnt: int):
-        super().__init__(device_cnt, batch_cnt)
+class SchedGPipe(Scheduler):
+    """
+    Equally slice the list of nodes into #worker pieces
+    """
 
-    def get_sched(self):
-        device_cnt = (
-            self.device_cnt if self.device_cnt <= self.batch_cnt else self.batch_cnt
-        )
+    def _build_sched(self):
+        node_cnt = len(self.graph.internal_nodes)
         batch_cnt = self.batch_cnt
-        self.device_cnt = device_cnt
+        worker_cnt = self.graph.worker_cnt
 
-        # (Step, device_no, microbatch_no)
-        sched: List[List[Tuple[Step, int, int]]] = []
+        worker_cnt = min(worker_cnt, node_cnt, batch_cnt)
+
+        # rank: (Step, node_no, microbatch_no)
+        sched: List[List[Step]] = []
+
+        rank_clusters = []
+        cls_len = node_cnt // worker_cnt
+        cls_rem = node_cnt % worker_cnt
+        start_pos = 0
+        for i in range(worker_cnt):
+            node_worker_len = cls_len + (1 if cls_rem > i else 0)
+            rank_clusters.append(range(start_pos, start_pos + node_worker_len))
+            start_pos += node_worker_len
 
         # calculate the width of trapozide
-        step_width = batch_cnt + device_cnt - 1
+        for cluster in rank_clusters:
+            rank_sched: List[Step] = []
 
-        # forward
-        forward_sched = []
-        for step_id in range(step_width):
-            step_sched = []
+            for batch_id in range(batch_cnt):
+                for node_id in cluster:
+                    rank_sched.append(Step(StepWork.RECV_ACT, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.FORWARD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.SEND_ACT, node_id, batch_id))
 
-            rng = (max(0, step_id - batch_cnt + 1), min(device_cnt, step_id + 1))
-            max_batch = min(step_id, batch_cnt - 1)
+            for batch_id in reversed(range(batch_cnt)):
+                for node_id in reversed(cluster):
+                    rank_sched.append(Step(StepWork.RECV_GRAD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.BACKWARD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.SEND_GRAD, node_id, batch_id))
 
-            for pre_idle in range(0, rng[0]):
-                step_sched.append((Step.IDLE, pre_idle, -1))
+            rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
 
-            for forward in range(rng[0], rng[1]):
-                step_sched.append((Step.FORWARD, forward, max_batch))
-                max_batch -= 1
+            sched.append(rank_sched)
 
-            for post_idle in range(rng[1], device_cnt):
-                step_sched.append((Step.IDLE, post_idle, -1))
-
-            forward_sched.append(list(reversed(step_sched)))
-
-        # backward
-        sched.extend(forward_sched)
-        for forward_step in reversed(forward_sched):
-            step_sched = []
-            for (step, dev_no, micro_no) in reversed(forward_step):
-                if step == Step.FORWARD:
-                    step = Step.BACKWARD
-                step_sched.append((step, dev_no, micro_no))
-            sched.append(step_sched)
-
-        # TODO: add optimizer step
-
-        return sched
-
-
-class Sched1F1B(SyncScheduler):
-    def __init__(self, device_cnt: int, batch_cnt: int):
-        super().__init__(device_cnt, batch_cnt)
-
-    def get_sched(self):
-        device_cnt = (
-            self.device_cnt if self.device_cnt <= self.batch_cnt else self.batch_cnt
-        )
-        batch_cnt = self.batch_cnt
-        self.device_cnt = device_cnt
-
-        # (Step, device_no, microbatch_no)
-        sched: List[List[Tuple[Step, int, int]]] = []
-
-        # calculate the width of trapozide
-        step_width = batch_cnt + device_cnt - 1
-
-        # forward
-        forward_sched = []
-        for step_id in range(step_width):
-            step_sched = []
-
-            rng = (min(0, step_id - batch_cnt + 1), max(device_cnt, step_id))
-            max_batch = min(step_id, batch_cnt - 1)
-
-            for pre_idle in range(0, rng[0]):
-                step_sched.append((Step.IDLE, pre_idle, -1))
-
-            for forward in range(rng[0], rng[1]):
-                step_sched.append((Step.FORWARD, forward, max_batch))
-                max_batch -= 1
-
-            for post_idle in range(range[1], device_cnt):
-                step_sched.append((Step.IDLE), post_idle, -1)
-
-            forward_sched.append(step_sched)
-
-        # backward
-        sched.extend(forward_sched)
-        for forward_step in reversed(forward_sched):
-            step_sched = []
-            for (step, dev_no, micro_no) in reversed(forward_step):
-                if step == Step.FORWARD:
-                    step = Step.BACKWARD
-                step_sched.append((step, dev_no, micro_no))
-            sched.append(step_sched)
-
-        # TODO: add optimizer step
-
-        return sched
+        return rank_clusters, sched

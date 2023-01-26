@@ -107,11 +107,6 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
             if n.op == "call_module":
                 idx = self.submodule_idx
 
-                # TODO: set next_device
-                device_max = self.manager.pipe_split
-                device = f"cuda:{idx}"
-                next_device = f"cuda:{idx+1}"
-
                 for arg in args:
                     if torch.is_tensor(arg):
                         arg = arg.to("cpu")
@@ -137,20 +132,6 @@ class SubmodCompiler(torch.fx.interpreter.Interpreter):
                 self.module.delete_submodule(n.target)
                 n.target = "compiled_" + n.target
                 self.module.add_submodule(n.target, stage_mod)
-
-                # break graph
-                if device_max > idx + 1:
-                    send_arg = Node(
-                        n.graph,
-                        f"{n.name}_sent",
-                        "call_function",
-                        graph_break,
-                        (n, next_device),
-                        dict(),
-                    )
-                    n.replace_all_uses_with(send_arg)
-                    send_arg.args = (n, next_device)
-                    n.append(send_arg)
 
                 self.submodule_idx += 1
                 return curr_submod(*new_args, **kwargs)
@@ -235,7 +216,7 @@ class PipeManager:
 
                 return use_idxs[0]
 
-            def move_param_to_callee(root, callee_name, param_val, use_idx, is_buffer):
+            def move_param_to_callee(root, node, callee_name, param_val, use_idx, is_buffer):
                 assert isinstance(param_val, torch.Tensor), (
                     f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}."
                     + (
@@ -298,7 +279,7 @@ class PipeManager:
                     is_buffer = atoms[-1] in mod_itr._buffers
 
                     move_param_to_callee(
-                        split_gm, user.target, param_val, use_idx, is_buffer
+                        split_gm, node, user.target, param_val, use_idx, is_buffer
                     )
 
                     to_delete.append((mod_itr, atoms))
