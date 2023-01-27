@@ -8,7 +8,8 @@ class PipeOption:
     'optimizer' (dict):
         'type' (str): Type of gradient optimizer (default: 'adam')
         other values: injected into kwargs of the optimzier __init__ method
-    'scheduler' (str): pipeline scheduling strategy (default: gpipe)
+    'scheduler' (str): pipeline scheduling strategy (default: 'gpipe')
+    'splitter' (str): how to split a model (default: 'param')
     'batch_cnt' (int): number of microbatches (default: 4)
     'device_cnt' (int): number of usable GPU devices (default: 2)
     'stage_cnt' (int): numbers of pipeline stages (default: same as device_cnt)
@@ -20,6 +21,7 @@ class PipeOption:
         self.batch_cnt = kwargs.get("batch_cnt", 4)
         self.device_cnt = kwargs.get("device_cnt", 2)
         self.stage_cnt = kwargs.get("stage_cnt", self.device_cnt)
+        self.splitter = kwargs.get("splitter", "param")
 
         optimizer = kwargs.get("optimizer", default_optimizer)
         self.optimzier_type = optimizer.setdefault("type", "adam")

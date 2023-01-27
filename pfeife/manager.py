@@ -32,9 +32,7 @@ class PipeGraphRunner(nn.Module):
         super().__init__()
         self.manager = manager
         self.gm = gm
-        self.graph = PipeGraph(
-            self.manager.rpc_workers,
-        )
+        self.graph = PipeGraph(self.manager.rpc_workers)
 
 
 class PipeManager:
@@ -42,29 +40,36 @@ class PipeManager:
         self,
         model,
         loss_fn: Union[_Loss, LossWrapper],
-        graph_splitter=None,
         option: PipeOption = PipeOption(),
     ):
         super().__init__()
         self.orig_model = model
-        self.pipe_split = pipe_split
-        self.batch_split = batch_split
         self.loss_fn = loss_fn
+        self.set_option(option)
 
-        sched_cls = Sched1F1B if scheduler == "1f1b" else SchedGPipe
-        self.sched = sched_cls(device_cnt=pipe_split, batch_cnt=batch_split)
-
-        self.splitter = (
-            ParamSplit(pipe_split) if graph_splitter is None else graph_splitter
-        )
-        self.dynamo_backend = dynamo_backend
         self.rpc_workers = []
         self.last_batch_no = 0
 
         self._compile()
 
-        # TODO: late initialize optimizer after dynamo compilation?
-        self.optimizer_cls = optimizer
+    def set_option(self, option: PipeOption):
+        self.stage_cnt = option.stage_cnt
+        self.batch_cnt = option.batch_cnt
+        self.device_cnt = option.device_cnt
+
+        # TODO: split by other strategies
+        self.splitter = ParamSplit(self.stage_cnt)
+
+        # TODO: check this will remove (GC-out) worker objects
+        self.rpc_workers = []
+        for rank in range(1, self.device_cnt + 1):
+            device = f"cuda:{rank-1}"
+            worker = rpc.remote(
+                f"worker_{rank}",
+                RPCStage,
+                args=(rank, device, option),
+            )
+            self.rpc_workers.append(worker)
 
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
@@ -164,34 +169,15 @@ class PipeManager:
             )
             print(split_gm.graph)
 
-            trace_gen = PipeGraphRunner(self, split_gm)
+            runner = PipeGraphRunner(self, split_gm)
 
-            return trace_gen
+            return runner
 
         dynamo_ctx = dynamo.optimize(compile_fn)
         self.opt_model = dynamo_ctx(self.orig_model)
 
-    def reset_batch_no(self):
-        self.batch_no_last = 0
-
-    def get_batch_no(self):
-        no = self.batch_no_last
-        self.batch_no_last += 1
-        return no
-
-    def add_stage(self, stage_mod):
-        # stage = rpc.remote(
-        #     f"worker_{idx+1}",
-        #     RPCStage,
-        #     args=(idx, stage_mod, compiler, self.optimizer_cls),
-        # )
-        # self.rpc_stages.append(stage)
-        # return stage
-        pass
-
     def train(self):
         self.opt_model.train()
-        # TODO: rpc send train
 
     def eval(self):
         self.opt_model.eval()

@@ -44,7 +44,7 @@ class Scheduler:
         # returns (worker_id: idx list of assigned node, worker_id: List[Step])
         raise NotImplementedError()
 
-    def assign_steps_to_workers(self, modules: List[torch.nn.Module]):
+    def assign_train_steps_to_workers(self, modules: List[torch.nn.Module]):
         rank_clusters = self.cluster
 
         devices = []
@@ -66,15 +66,19 @@ class Scheduler:
             zip(self.graph.workers, rank_clusters)
         ):
             worker.rpc_sync().set_graph(self.graph)
-            worker.rpc_sync().set_scheduler_steps(self.get_steps(worker_id))
+            worker.rpc_sync().set_scheduler_steps(self.get_train_steps(worker_id))
             for mod_id in cluster:
                 module = modules[mod_id]
                 worker.rpc_sync().set_module(mod_id, module)
 
-    def get_steps(self, worker_id: int) -> List[Step]:
+    def get_train_steps(self, worker_id: int) -> List[Step]:
         if worker_id >= len(self.sched):
             return []
         return self.sched[worker_id]
+
+    def get_eval_steps(self, worker_id: int) -> List[Step]:
+        # TODO: implement it
+        pass
 
 
 class SchedGPipe(Scheduler):

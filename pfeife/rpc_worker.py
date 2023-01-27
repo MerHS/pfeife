@@ -1,9 +1,8 @@
 import threading
-from typing import Callable, Optional, List, TYPE_CHECKING
-from inspect import Signature, Parameter
+from typing import Dict, List, TYPE_CHECKING
 
 import torch
-import torch.fx as fx
+import torch.nn as nn
 import torch.optim as optim
 from torch.fx import Node
 from torch.distributed.rpc import PyRRef
@@ -39,15 +38,16 @@ class WrapperModule(torch.nn.Module):
 
 
 class RPCWorker:
-    def __init__(self, rank, option: PipeOption):
+    def __init__(self, rank: int, device: str, option: PipeOption):
         # TODO: should we use lock?
         self.lock = threading.Lock()
         self.rank = rank
-        self.device = f"cuda:{rank-1}"
+        self.device = device
         self.is_compiled = False
         self.compiler = option.compiler
-        self.mods = dict()
+        self.mods: Dict[str, nn.Module] = dict()
         self.graph = None
+        self.is_train = True
 
         if type(self.compiler) == str:
             if self.compiler == "inductor":
@@ -88,6 +88,14 @@ class RPCWorker:
 
     def set_device(self, device):
         self.device = device
+
+    def set_train(self, train: bool):
+        self.is_train = train
+        for mod in self.mods.values():
+            if self.is_train:
+                mod.train()
+            else:
+                mod.eval()
 
     def set_module(self, mod_id, module):
         self.mods[mod_id] = module.to(self.device)
