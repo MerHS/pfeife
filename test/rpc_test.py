@@ -32,7 +32,6 @@ def run_local(rank, main_fn, args, pipe_split):
     # torch.distributed.init_process_group(
     #     backend=backend, rank=rank, world_size=world_size
     # )
-
     if rank == 0:
         rpc.init_rpc(
             "master",
@@ -111,7 +110,9 @@ class Worker:
     def recv(self):
         with self.rv:
             self.rv.wait_for(lambda: self.value is not None)
-            return self.value
+            v = self.value
+            self.value = None
+            return v
 
     def append(self, load_type, value):
         with self.cv:
@@ -131,13 +132,26 @@ def run(no):
 
     future = workers[-1].rpc_async().recv()
     time.sleep(2)
+    workers[0].rpc_async().send(-10)
+    future.wait()
+    print("result:", future.value())
+
+    future = workers[-1].rpc_async().recv()
+    time.sleep(2)
     workers[0].rpc_async().append("send", 0)
 
     future.wait()
     print("result:", future.value())
-    for worker in workers:
-        worker.rpc_async().stop()
 
+    future = workers[-1].rpc_async().recv()
+    time.sleep(2)
+    workers[0].rpc_async().append("send", 5)
+
+    future.wait()
+    print("result:", future.value())
+
+    # for worker in workers:
+    #     worker.rpc_async().stop()
 
 
 if __name__ == "__main__":
