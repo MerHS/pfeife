@@ -1,10 +1,9 @@
-from typing import List, Dict
 import operator
+from typing import Dict, List
 
-import torch
-import torch.nn as nn
-from torch.fx import GraphModule, Node
 from torch.distributed.rpc import PyRRef
+from torch.fx import GraphModule, Node
+
 from .rpc_worker import RPCWorker
 
 

@@ -1,10 +1,9 @@
-from typing import List, Any, Tuple
+from typing import List, Tuple
 from enum import Enum
 from dataclass import dataclass
 
 import torch
 
-from .trace import StepTrace
 from .pipe_graph import PipeGraph
 
 

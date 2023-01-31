@@ -1,6 +1,5 @@
 import os
 
-import torch
 import torch.distributed as dist
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
@@ -34,7 +33,7 @@ def run_local(rank, main_fn, args, pipe_split):
 
     if rank == 0:
         rpc.init_rpc(
-            f"master",
+            "master",
             rank=rank,
             world_size=world_size,
             rpc_backend_options=options,

@@ -1,38 +1,46 @@
-from typing import List, Any, Union
-import copy
+from typing import List, Union
 
 import torch
-import torch.nn as nn
-import torch.fx as fx
-import torch.optim as optim
-from torch.fx import Node
-import torch.fx.traceback as fx_traceback
-import torch.distributed.rpc as rpc
-
 import torch._dynamo as dynamo
-from torch._subclasses import UnsupportedFakeTensorException
-from torch.utils._pytree import tree_flatten
+import torch.distributed.rpc as rpc
+import torch.fx as fx
+import torch.nn as nn
 from torch.nn.modules.loss import _Loss
 
-
-from .graph_split import ParamSplit
-from .utils import get_logger
 from .batch import send_value, split_args_kwargs
-from .trace import graph_break, StepTrace, RPCStage, TraceInterpreter
-from .scheduler import SchedGPipe
+from .graph_split import ParamSplit
 from .loss import LossWrapper
-from .pipe_graph import PipeGraph
 from .option import PipeOption
+from .pipe_graph import PipeGraph
+from .rpc_worker import RPCWorker
+from .scheduler import SchedGPipe
+from .utils import get_logger
 
 log = get_logger()
 
 
+def get_submodules(gm: fx.GraphModule):
+    mods = []
+    for node in gm.graph.nodes:
+        if node.op == "call_module":
+            mods.append(node.target)
+    return mods
+
+
 class PipeGraphRunner(nn.Module):
-    def __init__(self, manager: "PipeManager", gm: fx.GraphModule):
+    def __init__(self, scheduler_cls, rpc_workers, batch_cnt, gm: fx.GraphModule):
         super().__init__()
-        self.manager = manager
-        self.gm = gm
-        self.graph = PipeGraph(self.manager.rpc_workers)
+
+        mods = get_submodules(gm)
+        self.graph = PipeGraph(rpc_workers)
+        self.sched = scheduler_cls(batch_cnt, self.graph)
+
+        self.sched.assign_train_steps_to_workers(mods)
+        self.first_node
+
+    def forward(self, *args, **kwargs):
+        # TODO: return Token
+        pass
 
 
 class PipeManager:
@@ -45,17 +53,17 @@ class PipeManager:
         super().__init__()
         self.orig_model = model
         self.loss_fn = loss_fn
+
         self.set_option(option)
-
-        self.rpc_workers = []
-        self.last_batch_no = 0
-
         self._compile()
 
     def set_option(self, option: PipeOption):
         self.stage_cnt = option.stage_cnt
         self.batch_cnt = option.batch_cnt
         self.device_cnt = option.device_cnt
+
+        # TODO: schedule by other strategies
+        self.scheduler = SchedGPipe
 
         # TODO: split by other strategies
         self.splitter = ParamSplit(self.stage_cnt)
@@ -66,13 +74,15 @@ class PipeManager:
             device = f"cuda:{rank-1}"
             worker = rpc.remote(
                 f"worker_{rank}",
-                RPCStage,
+                RPCWorker,
                 args=(rank, device, option),
             )
             self.rpc_workers.append(worker)
 
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
+            # TODO: what if this function is called two times from a training loop?
+
             qualname_map = {}
             split_gm = self.splitter.split(gm, qualname_map)
 
@@ -178,18 +188,17 @@ class PipeManager:
 
     def train(self):
         self.opt_model.train()
+        for worker in self.rpc_workers:
+            worker.rpc_sync().set_train(True)
 
     def eval(self):
         self.opt_model.eval()
-        # TDOO: rpc send eval
+        for worker in self.rpc_workers:
+            worker.rpc_sync().set_train(False)
 
-    def optimizer_zero_grad(self):
-        for stage in self.rpc_stages:
-            stage.rpc_sync().optimizer_zero_grad()
-
-    def optimizer_step(self):
-        for stage in self.rpc_stages:
-            stage.rpc_sync().optimizer_step()
+    def init_workers(self):
+        for worker in self.rpc_workers:
+            worker.rpc_sync().reset_cache()
 
     def run(self, target, *args, **kwargs):
         """
@@ -214,14 +223,14 @@ class PipeManager:
         args, kwargs = split_args_kwargs(args, kwargs, self.batch_split)
         targets, _ = split_args_kwargs([target], dict(), self.batch_split)
 
-        traces: List[StepTrace] = []
+        tokens = []
         for micro_args, micro_kwargs in zip(args, kwargs):
-            traces.append(self.opt_model(*micro_args, **micro_kwargs))
+            tokens.append(self.opt_model(*micro_args, **micro_kwargs))
+
+        # TODO: run and wait tokens
 
         # returns losses
         losses = self.sched.exec(traces, targets, self.loss_fn)
         loss = sum([l for l in losses if torch.is_tensor(l)])
-
-        self.optimizer_step()
 
         return loss

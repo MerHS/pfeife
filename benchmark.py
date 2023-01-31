@@ -2,17 +2,15 @@ import argparse
 import logging
 import os
 from datetime import datetime
-from functools import partial
+from test.utils import get_model, timed
 
 import torch
 import torch._dynamo as dynamo
+from torch.profiler import ProfilerActivity, profile
 
-from pfeife import run_master, PipeManager
-from pfeife.utils import get_logger
+from pfeife import PipeManager, run_master
 from pfeife.loss import SumLoss
-
-from test.utils import get_model, timed
-from torch.profiler import profile, ProfilerActivity
+from pfeife.utils import get_logger
 
 log = get_logger()
 

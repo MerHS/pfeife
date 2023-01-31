@@ -1,20 +1,18 @@
 import threading
-from typing import Dict, List, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.fx import Node
-from torch.distributed.rpc import PyRRef
-
 from torch._dynamo.optimizations import BACKENDS
 from torch._inductor.compile_fx import compile_fx
+from torch.distributed.rpc import PyRRef
+from torch.fx import Node
 from torch.utils._pytree import tree_flatten, tree_map
 
-
-from .utils import to_device
 from .option import PipeOption
 from .scheduler import Step, StepWork
+from .utils import to_device
 
 if TYPE_CHECKING:
     from .pipe_graph import PipeGraph
@@ -41,12 +39,14 @@ class RPCWorker:
     def __init__(self, rank: int, device: str, option: PipeOption):
         # TODO: should we use lock?
         self.lock = threading.Lock()
+        self.option = option
         self.rank = rank
         self.device = device
         self.is_compiled = False
         self.compiler = option.compiler
         self.mods: Dict[str, nn.Module] = dict()
         self.graph = None
+        self.optimizer = None
         self.is_train = True
 
         if type(self.compiler) == str:
@@ -56,15 +56,20 @@ class RPCWorker:
             else:
                 self.compiler = BACKENDS[self.compiler]
 
-        # TODO: Learning Rate
-        optimizer_cls = optim.Adam if option.optimizer_type == "adam" else optim.SGD
-        self.optimizer = optimizer_cls(
-            self.stage_mod.parameters(), **option.optimizer_kwargs
+        self.optimizer_cls = (
+            optim.Adam if option.optimizer_type == "adam" else optim.SGD
         )
 
         self.reset_cache()
 
+    def _init_optimizer(self):
+        self.optimizer = self.optimizer_cls(
+            self.stage_mod.parameters(), **self.option.optimizer_kwargs
+        )
+
     def reset_cache(self):
+        self.inputs = dict()
+        self.outputs = dict()
         self.fw_results = dict()
         self.fw_inputs = dict()
 
@@ -75,13 +80,16 @@ class RPCWorker:
         self.steps = steps
 
     def set_input(self, batch_id, input_value):
-        self.input = input_value
+        self.inputs[batch_id] = input_value
 
     def set_output(self, batch_id, output_value):
-        self.output = output_value
+        self.outputs[batch_id] = output_value
 
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
+
+    def set_module(self, mod_id, module):
+        self.mods[mod_id] = module.to(self.device)
 
     def get_device(self):
         return self.device
@@ -97,18 +105,8 @@ class RPCWorker:
             else:
                 mod.eval()
 
-    def set_module(self, mod_id, module):
-        self.mods[mod_id] = module.to(self.device)
-
-    def compile_submod(self, args):
-        def to_device(v):
-            if torch.is_tensor(v):
-                return v.to(self.device)
-            else:
-                return v
-
+    def compile_submod(self, submod, args):
         args = tree_map(to_device, args)
-        submod = self.stage_mod
 
         unwrap_singleton_tuple = False
         for sn in submod.graph.nodes:
@@ -168,9 +166,3 @@ class RPCWorker:
             next_grads = [g.grad.cpu() for g in back_input]
 
         return next_grads
-
-    def optimizer_zero_grad(self):
-        self.optimizer.zero_grad()
-
-    def optimizer_step(self):
-        self.optimizer.step()
