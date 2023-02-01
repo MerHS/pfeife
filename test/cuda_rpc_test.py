@@ -1,13 +1,12 @@
-import argparse 
+import argparse
+import os
+import time
 
 import torch
 import torch.distributed.autograd as autograd
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 import torch.nn as nn
-
-import os
-import time
 
 
 class MyModule(nn.Module):
@@ -47,40 +46,30 @@ def measure(comm_mode, dev0, dev1):
 
 
 def run_worker(rank, dev0, dev1):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "29500"
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=128)
 
     if rank == 0:
         print(f"{dev0} to {dev1}")
         options.set_device_map("worker1", {dev0: dev1})
         rpc.init_rpc(
-            f"worker{rank}",
-            rank=rank,
-            world_size=2,
-            rpc_backend_options=options
+            f"worker{rank}", rank=rank, world_size=2, rpc_backend_options=options
         )
         measure("cpu", dev0, dev1)
         measure("cuda", dev0, dev1)
     else:
         rpc.init_rpc(
-            f"worker{rank}",
-            rank=rank,
-            world_size=2,
-            rpc_backend_options=options
+            f"worker{rank}", rank=rank, world_size=2, rpc_backend_options=options
         )
 
     # block until all rpcs finish
     rpc.shutdown()
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "devs",
-        nargs="+",
-        type=int
-    )
+    parser.add_argument("devs", nargs="+", type=int)
     args = parser.parse_args()
     world_size = 2
     mp.spawn(run_worker, nprocs=world_size, join=True, args=args.devs)

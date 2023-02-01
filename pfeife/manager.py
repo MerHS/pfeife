@@ -27,6 +27,54 @@ def get_submodules(gm: fx.GraphModule):
     return mods
 
 
+def move_param_to_callee(
+    root, node, callee_name, param_val, qualname_map, use_idx, is_buffer
+):
+    assert isinstance(
+        param_val, torch.Tensor
+    ), f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}." + (
+        f" It might happen if module '{node.target}' was passed to some 'leaf function'"
+        f"(see https://pytorch.org/docs/stable/fx.html#pippy.fx.wrap). Please inspect "
+        f"usages of '{node.target}' in the traced graph."
+        if isinstance(param_val, torch.nn.Module)
+        else ""
+    )
+    callee = root.get_submodule(callee_name)
+    new_param_name = f"moved_{node.target.replace('.', '_')}"
+    assert not hasattr(
+        callee, new_param_name
+    ), f"Module {callee_name} already has a parameter named {new_param_name}"
+    if is_buffer:
+        callee.register_buffer(new_param_name, param_val)
+    else:
+        setattr(callee, new_param_name, param_val)
+
+    # Update qualname mapping
+    # New qualname will have submodule prefix
+    new_qualname = f"{callee_name}.{new_param_name}"
+    if node.target in qualname_map:
+        # Just in case the target name is already in the qualname_map
+        # returned by split_module() -- we update the mapping using the
+        # new name as a new key
+        qualname_map[new_qualname] = qualname_map.pop(node.target)
+    else:
+        qualname_map[new_qualname] = node.target
+
+    ph_counter = 0
+    for sn in callee.graph.nodes:
+        if sn.op == "placeholder":
+            if ph_counter == use_idx:
+                with callee.graph.inserting_before(sn):
+                    get_attr = callee.graph.get_attr(new_param_name)
+                    sn.replace_all_uses_with(get_attr)
+                    callee.graph.erase_node(sn)
+            ph_counter += 1
+    callee.graph.lint()
+    callee.recompile()
+
+    return get_attr
+
+
 class PipeGraphRunner(nn.Module):
     def __init__(self, scheduler_cls, rpc_workers, batch_cnt, gm: fx.GraphModule):
         super().__init__()
@@ -79,6 +127,9 @@ class PipeManager:
             )
             self.rpc_workers.append(worker)
 
+        for worker in self.rpc_workers:
+            worker.rpc_sync().set_workers(self.rpc_workers)
+
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
             # TODO: what if this function is called two times from a training loop?
@@ -98,54 +149,6 @@ class PipeManager:
 
                 return use_idxs[0]
 
-            def move_param_to_callee(
-                root, node, callee_name, param_val, use_idx, is_buffer
-            ):
-                assert isinstance(param_val, torch.Tensor), (
-                    f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}."
-                    + (
-                        f" It might happen if module '{node.target}' was passed to some 'leaf function'"
-                        f"(see https://pytorch.org/docs/stable/fx.html#pippy.fx.wrap). Please inspect "
-                        f"usages of '{node.target}' in the traced graph."
-                        if isinstance(param_val, torch.nn.Module)
-                        else ""
-                    )
-                )
-                callee = root.get_submodule(callee_name)
-                new_param_name = f"moved_{node.target.replace('.', '_')}"
-                assert not hasattr(
-                    callee, new_param_name
-                ), f"Module {callee_name} already has a parameter named {new_param_name}"
-                if is_buffer:
-                    callee.register_buffer(new_param_name, param_val)
-                else:
-                    setattr(callee, new_param_name, param_val)
-
-                # Update qualname mapping
-                # New qualname will have submodule prefix
-                new_qualname = f"{callee_name}.{new_param_name}"
-                if node.target in qualname_map:
-                    # Just in case the target name is already in the qualname_map
-                    # returned by split_module() -- we update the mapping using the
-                    # new name as a new key
-                    qualname_map[new_qualname] = qualname_map.pop(node.target)
-                else:
-                    qualname_map[new_qualname] = node.target
-
-                ph_counter = 0
-                for sn in callee.graph.nodes:
-                    if sn.op == "placeholder":
-                        if ph_counter == use_idx:
-                            with callee.graph.inserting_before(sn):
-                                get_attr = callee.graph.get_attr(new_param_name)
-                                sn.replace_all_uses_with(get_attr)
-                                callee.graph.erase_node(sn)
-                        ph_counter += 1
-                callee.graph.lint()
-                callee.recompile()
-
-                return get_attr
-
             to_delete = list()  # a list of nodes for deferral deletion
 
             for node in split_gm.graph.nodes:
@@ -163,7 +166,13 @@ class PipeManager:
                     is_buffer = atoms[-1] in mod_itr._buffers
 
                     move_param_to_callee(
-                        split_gm, node, user.target, param_val, use_idx, is_buffer
+                        split_gm,
+                        node,
+                        user.target,
+                        param_val,
+                        qualname_map,
+                        use_idx,
+                        is_buffer,
                     )
 
                     to_delete.append((mod_itr, atoms))
