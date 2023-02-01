@@ -13,6 +13,7 @@ from torch.utils._pytree import tree_flatten, tree_map
 from .option import PipeOption
 from .scheduler import Step, StepWork
 from .utils import to_device
+from .pipe_graph import PipeNode, PipeIO, PipeEdge
 
 if TYPE_CHECKING:
     from .pipe_graph import PipeGraph
@@ -41,12 +42,13 @@ class RPCWorker:
         self.rank = rank
         self.device = device
         self.compiler = option.compiler
+
         self.mods: Dict[str, nn.Module] = dict()
+        self.mod_compiled = set()
 
         self.graph = None
         self.optimizer = None
 
-        self.is_compiled = False
         self.is_train = True
 
         self.locks: Dict[str, threading.Condition] = dict()
@@ -67,6 +69,7 @@ class RPCWorker:
             else:
                 self.compiler = BACKENDS[self.compiler]
 
+        self.optimizer = None
         self.optimizer_cls = (
             optim.Adam if option.optimizer_type == "adam" else optim.SGD
         )
@@ -79,9 +82,11 @@ class RPCWorker:
         self.run_loop.start()
 
     def _init_optimizer(self):
-        self.optimizer = self.optimizer_cls(
-            self.stage_mod.parameters(), **self.option.optimizer_kwargs
-        )
+        if self.optimizer is None:
+            self.optimizer = self.optimizer_cls(
+                self.stage_mod.parameters(), **self.option.optimizer_kwargs
+            )
+        self.optimizer.zero_grad()
 
     def reset_cache(self):
         self.inputs = [None for _ in range(self.option.batch_cnt)]
@@ -116,10 +121,20 @@ class RPCWorker:
 
     def set_input(self, batch_id, args, kwargs):
         # TODO: check whether we should handle kwargs
-        cv = self.get_lock("io_data")
-        with cv:
+        io_cv = self.get_lock("io_data")
+        with io_cv:
             self.inputs[batch_id] = args
-            cv.notify()
+            io_cv.notify()
+
+        comm_cv = self.get_lock("fb_comm")
+        input_node = self.graph.input_node
+        with comm_cv:
+            for edge in input_node.out_edges:
+                value = args[edge.idx] if edge.idx is not None else args
+                for end_node in edge.end_nodes:
+                    comm_id = self.get_comm_id(0, end_node.idx, edge.idx, batch_id)
+                    self.fw_inputs[comm_id] = value
+            comm_cv.notify()
 
     def set_target(self, batch_id, target):
         cv = self.get_lock("io_data")
@@ -153,7 +168,7 @@ class RPCWorker:
         self.loss_fn = loss_fn
 
     def set_module(self, mod_id, module):
-        self.mods[mod_id] = module.to(self.device)
+        self.mods[mod_id + 1] = module.to(self.device)
 
     def get_device(self):
         return self.device
@@ -186,20 +201,22 @@ class RPCWorker:
             self.handle_job(job)
 
     def handle_job(self, job: Step):
+        node = self.graph.internal_nodes[job.node_id]
+
         if job.work == StepWork.SEND_ACT:
-            self.send_act(job.node_id, job.batch_id)
+            self.send_act(node, job.batch_id)
         elif job.work == StepWork.RECV_ACT:
-            self.recv_act(job.node_id, job.batch_id)
+            self.recv_act(node, job.batch_id)
         elif job.work == StepWork.FORWARD:
-            self.forward(job.node_id, job.batch_id)
+            self.forward(node, job.batch_id)
         elif job.work == StepWork.SEND_GRAD:
-            self.send_grad(job.node_id, job.batch_id)
+            self.send_grad(node, job.batch_id)
         elif job.work == StepWork.RECV_GRAD:
-            self.recv_grad(job.node_id, job.batch_id)
+            self.recv_grad(node, job.batch_id)
         elif job.work == StepWork.BACKWARD:
-            self.backward(job.node_id, job.batch_id)
+            self.backward(node, job.batch_id)
         elif job.work == StepWork.OPTIMIZER_STEP:
-            self.optimizer_step(job.node_id, job.batch_id)
+            self.optimizer_step(node, job.batch_id)
 
     def compile_submod(self, submod, args):
         args = tree_map(to_device, args)
@@ -217,63 +234,176 @@ class RPCWorker:
             unwrap_singleton_tuple,
         )
 
-        self.stage_mod = wrapper
+        return wrapper
 
-    def send_act(self, node_id, batch_id):
-        pass
+    def get_comm_id(self, start_id: int, end_id: int, edge_id: int, batch_id: int):
+        return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
 
-    def recv_act(self, node_id, batch_id):
-        pass
+    def push_fw_act(self, key: str, value):
+        cv = self.get_lock("fb_comm")
+        with cv:
+            self.fw_inputs[key] = value
+            cv.notify()
 
-    def send_grad(self, node_id, batch_id):
-        pass
+    def push_bw_grad(self, key: str, value):
+        cv = self.get_lock("fb_comm")
+        with cv:
+            self.bw_grads[key] = value
+            cv.notify()
 
-    def recv_grad(self, node_id, batch_id):
-        pass
+    def send_act(self, node: PipeNode, batch_id: int):
+        cv = self.get_lock("fb_comm")
+        curr_rank = node.rank
+        curr_id = node.idx
 
-    def optimizer_step(self, node_id, batch_id):
-        pass
+        # TODO: check this requires a lock
+        value = self.fw_results[batch_id]
 
-    def forward(self, node_id, batch_id):
-        if self.rank == 0:
-            args = [a.to(self.device) for a in args]
-        else:
-            fw_args = [a.detach().to(self.device).requires_grad_(True) for a in args]
-            self.fw_inputs[batch_no] = fw_args
-            args = [a.clone() for a in fw_args]
+        # check multi rank output
+        same_rank = False
+        diff_rank = False
+        for edge in node.out_edges:
+            for end_node in edge.end_nodes:
+                if end_node.rank != curr_rank:
+                    same_rank = True
+                else:
+                    diff_rank = True
 
-        with self.lock:
-            if not self.is_compiled:
-                self.compile_submod(args)
-                self.is_compiled = True
-            result = self.stage_mod(*args)
-            self.fw_results[batch_no] = result
+        if same_rank and diff_rank:
 
-        result_cpu = [r.detach().cpu() for r in result]
+            def detach(v):
+                if torch.is_tensor(v) and v.requires_grad:
+                    return v.detach().requires_grad_(True)
+                else:
+                    return v
 
-        return result_cpu
+            value = tree_map(detach, value)
 
-    def forward_loss(self, batch_no, target, loss_fn):
-        with self.lock:
-            last_result = self.fw_results[batch_no]
-            loss = loss_fn(last_result, target)
-            self.fw_results[batch_no] = loss
+        with cv:
+            for edge in node.out_edges:
+                for end_node in edge.end_nodes:
+                    comm_id = self.get_comm_id(
+                        curr_id, end_node.idx, edge.idx, batch_id
+                    )
 
-        loss_cpu = loss.detach().cpu()
+                    if edge.idx is not None:
+                        value_send = value[edge.idx]
+                    else:
+                        value_send = value
 
-        return loss_cpu
+                    if end_node.rank == curr_rank:
+                        self.fw_inputs[comm_id] = value_send
+                    else:
+                        send_ref = self.workers[end_node.rank - 1]
+                        send_ref.rpc_async().push_fw_act(comm_id, value_send)
+            cv.notify()
 
-    def backward(self, node_id, batch_id):
-        if grads is not None:
-            grads = [a.to(self.device) for a in grads]
+    def recv_act(self, node: PipeNode, batch_id: int):
+        cv = self.get_lock("fb_comm")
+        curr_id = node.idx
 
-        with self.lock:
-            torch.autograd.backward(self.fw_results[batch_no], grads)
+        input_keys = []
+        for edge in node.in_edges:
+            comm_id = self.get_comm_id(edge.start_node.id, curr_id, edge.idx, batch_id)
+            input_keys.append(comm_id)
 
-        next_grads = []
+        def checker():
+            for key in input_keys:
+                if key not in self.fw_inputs:
+                    return False
+            return True
 
-        if self.rank != 0:
-            back_input = self.fw_inputs[batch_no]
-            next_grads = [g.grad.cpu() for g in back_input]
+        with cv:
+            cv.wait_for(checker)
 
-        return next_grads
+    def send_grad(self, node: PipeNode, batch_id: int):
+        cv = self.get_lock("fb_comm")
+        curr_rank = node.rank
+        curr_id = node.idx
+
+        with cv:
+            for edge in node.in_edges:
+                start_node = edge.start_node
+                comm_id = self.get_comm_id(start_node.idx, curr_id, edge.idx, batch_id)
+
+                value = self.fw_inputs[comm_id]
+                value = tree_map(lambda v: (v.grad if torch.is_tensor(v) else v), value)
+
+                if start_node.rank == curr_rank:
+                    self.bw_grads[comm_id] = value
+                else:
+                    send_ref = self.workers[start_node.rank - 1]
+                    send_ref.rpc_async().push_bw_grad(comm_id, value)
+
+            cv.notify()
+
+    def recv_grad(self, node: PipeNode, batch_id: int):
+        cv = self.get_lock("fb_comm")
+        curr_id = node.idx
+
+        grad_keys = []
+        for edge in node.out_edges:
+            for end_node in edge.end_nodes:
+                comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
+                grad_keys.append(comm_id)
+
+        def checker():
+            for key in grad_keys:
+                if key not in self.bw_grads:
+                    return False
+            return True
+
+        with cv:
+            cv.wait_for(checker)
+
+    def optimizer_step(self, node: PipeNode, batch_id: int):
+        self._init_optimizer()
+        self.optimizer.step()
+
+    def forward(self, node: PipeNode, batch_id: int):
+        curr_id = node.idx
+        inputs = []
+        for edge in node.in_edges:
+            comm_id = self.get_comm_id(edge.start_node.id, curr_id, edge.idx, batch_id)
+            value = self.fw_inputs[comm_id]
+            inputs.append(value)
+
+        mod = self.mods[curr_id]
+
+        if curr_id not in self.mod_compiled:
+            mod = self.compile_submod(self.mods[curr_id], inputs)
+            self.mods[curr_id] = mod
+            self.mod_compiled.add(curr_id)
+
+        result = mod(*inputs)
+
+        # TODO: multi-node output node
+        if self.loss_fn is not None:
+            io_cv = self.get_lock("io_data")
+            with io_cv:
+                io_cv.wait_for(lambda: self.targets[batch_id] is not None)
+                result = self.loss_fn(result, self.targets[batch_id])
+
+        self.fw_results[batch_id] = result
+
+    def backward(self, node: PipeNode, batch_id: int):
+        curr_id = node.idx
+
+        grads = []
+        for edge in node.out_edges:
+            if edge.end_nodes[0] == self.graph.output_node:
+                grads = None
+                break
+
+            grad = None
+            for end_node in edge.end_nodes:
+                comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
+                comm_grad = self.bw_grads[comm_id]
+                # TODO: reduce properly
+                if grad is None:
+                    grad = comm_grad
+                else:
+                    grad += comm_grad
+            grads.append(comm_id)
+
+        torch.autograd.backward(self.fw_results[batch_id], grads)

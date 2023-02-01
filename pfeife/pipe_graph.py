@@ -8,11 +8,13 @@ from .rpc_worker import RPCWorker
 
 
 class PipeNode:
-    def __init__(self, rank: int):
+    def __init__(self, idx: int, rank: int, is_io=False):
+        self.idx = idx
         self.rank = rank  # 0: master/io, 1+: worker
         self.in_edges: List["PipeEdge"] = []
         self.out_edges: List["PipeEdge"] = []
         self.device = "cpu"
+        self.is_io = is_io
 
     def append_in(self, edge: "PipeEdge", idx: int = -1):
         self._append(self.in_edges, edge, idx)
@@ -33,19 +35,6 @@ class PipeNode:
         self.device = device
 
 
-class PipeIO(PipeNode):
-    pass
-
-
-class PipeWorker(PipeNode):
-    def __init__(self, rank: int, worker=None):
-        super().__init__(rank)
-        self.worker = worker
-
-    def set_worker(self, worker: RPCWorker):
-        self.worker = worker
-
-
 class PipeEdge:
     def __init__(self, start_node: PipeNode, item_idx=None):
         self.start_node = start_node
@@ -57,17 +46,16 @@ class PipeEdge:
 
 
 class PipeGraph:
-    def __init__(self, rpc_workers: List[PyRRef], gm: GraphModule = None):
-        self.worker_cnt = len(rpc_workers)
-        self.workers = rpc_workers
+    def __init__(self, worker_cnt: int, gm: GraphModule = None):
+        self.worker_cnt = worker_cnt
 
         if gm is not None:
             self.build_graph(gm)
 
     def build_graph(self, gm: GraphModule):
-        self.input_node = PipeIO(0)
-        self.output_node = PipeIO(0)
-        self.internal_nodes: List[PipeWorker] = []  # topo-sorted list of nodes
+        self.input_node = PipeNode(0, 0, is_io=True)
+        self.output_node = PipeNode(0, 0, is_io=True)
+        self.internal_nodes: List[PipeNode] = []  # topo-sorted list of nodes
         self.node_dict: Dict[str, PipeNode] = dict()
         self.edge_dict: Dict[str, PipeEdge] = dict()
 
@@ -83,7 +71,7 @@ class PipeGraph:
             elif node.op == "call_module":  # worker
                 node_cnt += 1
                 rank = (node_cnt // self.worker_cnt) + 1
-                worker = PipeWorker(rank)
+                worker = PipeNode(node_cnt, rank)
 
                 self.internal_nodes.append(worker)
                 self.node_dict[node.name] = worker
@@ -131,3 +119,4 @@ class PipeGraph:
 
         self.input_node.rank = self.internal_nodes[0].rank
         self.output_node.rank = self.internal_nodes[-1].rank
+        self.output_node.idx = len(self.internal_nodes) + 1

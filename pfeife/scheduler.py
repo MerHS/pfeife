@@ -3,6 +3,7 @@ from enum import Enum
 from dataclass import dataclass
 
 import torch
+from torch.distributed.rpc import PyRRef
 
 from .pipe_graph import PipeGraph
 
@@ -46,12 +47,14 @@ class Scheduler:
         # returns node clusters and steps
         raise NotImplementedError()
 
-    def assign_train_steps_to_workers(self, modules: List[torch.nn.Module]):
+    def assign_train_steps_to_workers(
+        self, workers: List[PyRRef], modules: List[torch.nn.Module]
+    ):
         rank_clusters = self.cluster
 
         devices = []
-        for worker_id, cluster in rank_clusters:
-            worker = self.graph.workers[worker_id]
+        for worker_id, cluster in enumerate(rank_clusters):
+            worker = workers[worker_id]
             worker_device = worker.rpc_sync().get_device()
             devices.append(worker_device)
 
@@ -64,9 +67,7 @@ class Scheduler:
         output_node = self.graph.output_node
         output_node.device = devices[output_node.rank - 1]
 
-        for worker_id, (worker, cluster) in enumerate(
-            zip(self.graph.workers, rank_clusters)
-        ):
+        for worker_id, (worker, cluster) in enumerate(zip(workers, rank_clusters)):
             worker.rpc_sync().set_graph(self.graph)
             worker.rpc_sync().set_scheduler_steps(self.get_train_steps(worker_id))
             for mod_id in cluster:

@@ -93,12 +93,12 @@ class PipeGraphRunner(nn.Module):
         super().__init__()
 
         self.manager = manager
-        self.graph = PipeGraph(manager.rpc_workers)
+        self.graph = PipeGraph(len(manager.rpc_workers))
         self.sched = manager.scheduler(manager.batch_cnt, self.graph)
         self.workers = manager.rpc_workers
 
         mods = get_submodules(gm)
-        self.sched.assign_train_steps_to_workers(mods)
+        self.sched.assign_train_steps_to_workers(manager.rpc_workers, mods)
 
         input_rank = self.graph.input_node.rank
         output_rank = self.graph.output_node.rank
