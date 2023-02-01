@@ -6,6 +6,7 @@ import torch.distributed.rpc as rpc
 import torch.fx as fx
 import torch.nn as nn
 from torch.nn.modules.loss import _Loss
+from torch.distributed.rpc import PyRRef
 
 from .batch import send_value, split_args_kwargs
 from .graph_split import ParamSplit
@@ -13,7 +14,7 @@ from .loss import LossWrapper
 from .option import PipeOption
 from .pipe_graph import PipeGraph
 from .rpc_worker import RPCWorker
-from .scheduler import SchedGPipe
+from .scheduler import get_scheduler
 from .utils import get_logger
 
 log = get_logger()
@@ -75,20 +76,49 @@ def move_param_to_callee(
     return get_attr
 
 
+# TODO: make it a real tensor
+class PipeTensor:
+    def __init__(self, batch_no, output_token, backward_token=None):
+        self.batch_no = batch_no
+        self.output_token = output_token
+        self.backward_token = backward_token
+
+
 class PipeGraphRunner(nn.Module):
-    def __init__(self, scheduler_cls, rpc_workers, batch_cnt, gm: fx.GraphModule):
+    def __init__(
+        self,
+        manager: "PipeManager",
+        gm: fx.GraphModule,
+    ):
         super().__init__()
 
-        mods = get_submodules(gm)
-        self.graph = PipeGraph(rpc_workers)
-        self.sched = scheduler_cls(batch_cnt, self.graph)
+        self.manager = manager
+        self.graph = PipeGraph(manager.rpc_workers)
+        self.sched = manager.scheduler(manager.batch_cnt, self.graph)
+        self.workers = manager.rpc_workers
 
+        mods = get_submodules(gm)
         self.sched.assign_train_steps_to_workers(mods)
-        self.first_node
 
     def forward(self, *args, **kwargs):
-        # TODO: return Token
-        pass
+        # return Future[Token]
+        batch_no = self.manager.get_batch_no()
+
+        input_rank = self.graph.input_node.rank
+        output_rank = self.graph.output_node.rank
+        in_worker = self.workers[input_rank - 1]
+        out_worker = self.workers[output_rank - 1]
+
+        in_worker.rpc_sync().set_input(batch_no, args, kwargs)
+
+        output_token = (
+            out_worker.rpc_async().get_io_token(batch_no)
+            if self.manager.is_train
+            else None
+        )
+        backward_token = in_worker.rpc_async().get_io_token(batch_no)
+
+        return PipeTensor(batch_no, output_token, backward_token)
 
 
 class PipeManager:
@@ -101,6 +131,8 @@ class PipeManager:
         super().__init__()
         self.orig_model = model
         self.loss_fn = loss_fn
+        self.batch_no = 0
+        self.is_train = True
 
         self.set_option(option)
         self._compile()
@@ -110,14 +142,14 @@ class PipeManager:
         self.batch_cnt = option.batch_cnt
         self.device_cnt = option.device_cnt
 
-        # TODO: schedule by other strategies
-        self.scheduler = SchedGPipe
+        self.runner = None
+        self.scheduler = get_scheduler(option.scheduler)
 
         # TODO: split by other strategies
         self.splitter = ParamSplit(self.stage_cnt)
 
         # TODO: check this will remove (GC-out) worker objects
-        self.rpc_workers = []
+        self.rpc_workers: List[PyRRef] = []
         for rank in range(1, self.device_cnt + 1):
             device = f"cuda:{rank-1}"
             worker = rpc.remote(
@@ -189,6 +221,7 @@ class PipeManager:
             print(split_gm.graph)
 
             runner = PipeGraphRunner(self, split_gm)
+            self.runner = runner
 
             return runner
 
@@ -196,18 +229,27 @@ class PipeManager:
         self.opt_model = dynamo_ctx(self.orig_model)
 
     def train(self):
+        self.is_train = True
         self.opt_model.train()
         for worker in self.rpc_workers:
             worker.rpc_sync().set_train(True)
 
     def eval(self):
+        self.is_train = False
         self.opt_model.eval()
         for worker in self.rpc_workers:
             worker.rpc_sync().set_train(False)
 
-    def init_workers(self):
+    def init_runner(self):
         for worker in self.rpc_workers:
             worker.rpc_sync().reset_cache()
+
+        self.batch_no = 0
+
+    def get_batch_no(self):
+        batch_no = self.batch_no
+        self.batch_no += 1
+        return batch_no
 
     def run(self, target, *args, **kwargs):
         """
@@ -216,30 +258,32 @@ class PipeManager:
         3. return loss
         """
 
-        for stage in self.rpc_stages:
-            stage.rpc_sync().reset_cache()
-
-        self.reset_batch_no()
-        self.optimizer_zero_grad()
-
-        # TODO: should we move args to gpu 0 before splitting?
-        args = send_value(args, "cuda:0")
-        kwargs = send_value(kwargs, "cuda:0")
-
-        # TODO: check last device
-        target = send_value(target, f"cuda:{self.pipe_split - 1}")
+        # TODO: evaluation pass
+        self.init_runner()
 
         args, kwargs = split_args_kwargs(args, kwargs, self.batch_split)
         targets, _ = split_args_kwargs([target], dict(), self.batch_split)
 
-        tokens = []
+        # TODO: Custom Tensor model
+        tokens: List[PipeTensor] = []
         for micro_args, micro_kwargs in zip(args, kwargs):
             tokens.append(self.opt_model(*micro_args, **micro_kwargs))
 
-        # TODO: run and wait tokens
+        out_rank = self.runner.graph.output_node.rank
+        out_worker = self.rpc_workers[out_rank - 1]
+        for batch_id, target in enumerate(targets):
+            out_worker.rpc_sync().set_target(batch_id, target)
 
-        # returns losses
-        losses = self.sched.exec(traces, targets, self.loss_fn)
-        loss = sum([l for l in losses if torch.is_tensor(l)])
+        # ignite worker (add jobs to job queue)
+        for worker in self.rpc_workers:
+            worker.rpc_sync().fire()
+
+        # run and wait tokens
+        for pt in tokens:
+            pt.output_token.wait()
+            if pt.backward_token is not None:
+                pt.backward_token.wait()
+
+        loss = out_worker.rpc_sync().get_loss("sum")
 
         return loss

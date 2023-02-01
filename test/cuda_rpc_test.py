@@ -45,6 +45,25 @@ def measure(comm_mode, dev0, dev1):
     print(f"({comm_mode} {dev0} => {dev1}) RPC total execution time: {tok - tik}")
 
 
+def test_grad_next(tensor: torch.Tensor):
+    print(tensor)
+    print(tensor.grad, tensor.device)
+    if tensor.grad is not None:
+        print(tensor.grad.device)
+
+
+def test_grad(dev0, dev1):
+    t = torch.rand(2, 2, requires_grad=True, device=dev0)
+    t.grad = torch.rand(2, 2, device=dev0)
+
+    print(t)
+    print(t.grad, t.device)
+    if t.grad is not None:
+        print(t.grad.device)
+
+    rpc.remote("worker1", test_grad_next, args=(t,))
+
+
 def run_worker(rank, dev0, dev1):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
@@ -58,6 +77,7 @@ def run_worker(rank, dev0, dev1):
         )
         measure("cpu", dev0, dev1)
         measure("cuda", dev0, dev1)
+        test_grad(dev0, dev1)
     else:
         rpc.init_rpc(
             f"worker{rank}", rank=rank, world_size=2, rpc_backend_options=options

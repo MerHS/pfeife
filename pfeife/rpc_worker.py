@@ -37,17 +37,28 @@ class WrapperModule(torch.nn.Module):
 
 class RPCWorker:
     def __init__(self, rank: int, device: str, option: PipeOption):
-        # TODO: should we use lock?
-        self.lock = threading.Lock()
         self.option = option
         self.rank = rank
         self.device = device
-        self.is_compiled = False
         self.compiler = option.compiler
         self.mods: Dict[str, nn.Module] = dict()
+
         self.graph = None
         self.optimizer = None
+
+        self.is_compiled = False
         self.is_train = True
+
+        self.locks: Dict[str, threading.Condition] = dict()
+
+        # handle job queue
+        self.add_lock("job_queue")
+        # handle io tokens for the master node
+        self.add_lock("io_tokens")
+        # handle io data for the master node
+        self.add_lock("io_data")
+        # handle communication. (fw act / bw grad)
+        self.add_lock("fb_comm")
 
         if type(self.compiler) == str:
             if self.compiler == "inductor":
@@ -62,16 +73,39 @@ class RPCWorker:
 
         self.reset_cache()
 
+        self.run_loop = threading.Thread(
+            target=self.runner, name=f"worker_runner_{rank}", daemon=True
+        )
+        self.run_loop.start()
+
     def _init_optimizer(self):
         self.optimizer = self.optimizer_cls(
             self.stage_mod.parameters(), **self.option.optimizer_kwargs
         )
 
     def reset_cache(self):
-        self.inputs = dict()
-        self.outputs = dict()
+        self.inputs = [None for _ in range(self.option.batch_cnt)]
+        self.targets = [None for _ in range(self.option.batch_cnt)]
+        self.losses = [None for _ in range(self.option.batch_cnt)]
+        self.outputs = [None for _ in range(self.option.batch_cnt)]
+
         self.fw_results = dict()
         self.fw_inputs = dict()
+        self.bw_grads = dict()
+
+        self.io_tokens = [None for _ in range(self.option.batch_cnt)]
+        self.job_queue = []
+
+    def add_lock(self, name):
+        lock = threading.Lock()
+        cv = threading.Condition(lock)
+        self.locks[name] = cv
+
+    def get_lock(self, name):
+        return self.locks[name]
+
+    def set_workers(self, workers: List[PyRRef]):
+        self.workers = workers
 
     def set_graph(self, pipe_graph: PipeGraph):
         self.graph = pipe_graph
@@ -79,8 +113,37 @@ class RPCWorker:
     def set_scheduler_steps(self, steps: List[Step]):
         self.steps = steps
 
-    def set_input(self, batch_id, input_value):
-        self.inputs[batch_id] = input_value
+    def set_input(self, batch_id, args, kwargs):
+        # TODO: check whether we should handle kwargs
+        cv = self.get_lock("io_data")
+        with cv:
+            self.inputs[batch_id] = args
+            cv.notify()
+
+    def set_target(self, batch_id, target):
+        cv = self.get_lock("io_data")
+        with cv:
+            self.targets[batch_id] = target
+            cv.notify()
+
+    def get_io_token(self, batch_id):
+        cv = self.get_lock("io_tokens")
+        with cv:
+            cv.wait_for(lambda: self.io_tokens[batch_id] is not None)
+            return self.io_tokens[batch_id]
+
+    def get_loss(self, reduce="sum"):
+        # reduce: 'sum', 'average', None (return list of losses)
+        cv = self.get_lock("io_tokens")
+        with cv:
+            cv.wait_for(lambda: all([loss is not None for loss in self.losses]))
+            if reduce == "sum":
+                loss = torch.sum(self.losses)
+            elif reduce == "average":
+                loss = torch.mean(self.losses)
+            else:
+                loss = self.losses
+            return loss
 
     def set_output(self, batch_id, output_value):
         self.outputs[batch_id] = output_value
@@ -104,6 +167,25 @@ class RPCWorker:
                 mod.train()
             else:
                 mod.eval()
+
+    def fire(self):
+        cv = self.get_lock("job_queue")
+        with cv:
+            # TODO: append job queue
+            cv.notify()
+
+    def runner(self):
+        cv = self.get_lock("job_queue")
+        while True:
+            with cv:
+                self.cv.wait_for(lambda: len(self.job_queue) > 0)
+                job = self.job_queue.pop(0)
+
+            # TODO: handle job
+            self.handle_job(job)
+
+    def handle_job(self, job):
+        pass
 
     def compile_submod(self, submod, args):
         args = tree_map(to_device, args)

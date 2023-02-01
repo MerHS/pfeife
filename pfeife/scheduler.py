@@ -37,10 +37,13 @@ class Scheduler:
     def __init__(self, batch_cnt: int, graph: PipeGraph):
         self.batch_cnt = batch_cnt
         self.graph = graph
+
+        # self.cluster: list of (indices of assigned node)
+        # self.sched: list of List[Step]
         self.cluster, self.sched = self._build_sched()
 
     def _build_sched(self):
-        # returns (worker_id: idx list of assigned node, worker_id: List[Step])
+        # returns node clusters and steps
         raise NotImplementedError()
 
     def assign_train_steps_to_workers(self, modules: List[torch.nn.Module]):
@@ -125,3 +128,10 @@ class SchedGPipe(Scheduler):
             sched.append(rank_sched)
 
         return rank_clusters, sched
+
+
+def get_scheduler(sched_name: str = "gpipe"):
+    if sched_name == "gpipe":
+        return SchedGPipe
+    else:
+        raise NameError(f"Unknown scheduler: {sched_name}")
