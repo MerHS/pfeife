@@ -94,7 +94,8 @@ class RPCWorker:
         self.bw_grads = dict()
 
         self.io_tokens = [None for _ in range(self.option.batch_cnt)]
-        self.job_queue = []
+        self.job_queue: List[Step] = []
+        self.current_job: Step = None
 
     def add_lock(self, name):
         lock = threading.Lock()
@@ -171,7 +172,7 @@ class RPCWorker:
     def fire(self):
         cv = self.get_lock("job_queue")
         with cv:
-            # TODO: append job queue
+            self.job_queue = [job for job in self.steps]
             cv.notify()
 
     def runner(self):
@@ -181,11 +182,24 @@ class RPCWorker:
                 self.cv.wait_for(lambda: len(self.job_queue) > 0)
                 job = self.job_queue.pop(0)
 
-            # TODO: handle job
+            # synchronous handle job
             self.handle_job(job)
 
-    def handle_job(self, job):
-        pass
+    def handle_job(self, job: Step):
+        if job.work == StepWork.SEND_ACT:
+            self.send_act(job.node_id, job.batch_id)
+        elif job.work == StepWork.RECV_ACT:
+            self.recv_act(job.node_id, job.batch_id)
+        elif job.work == StepWork.FORWARD:
+            self.forward(job.node_id, job.batch_id)
+        elif job.work == StepWork.SEND_GRAD:
+            self.send_grad(job.node_id, job.batch_id)
+        elif job.work == StepWork.RECV_GRAD:
+            self.recv_grad(job.node_id, job.batch_id)
+        elif job.work == StepWork.BACKWARD:
+            self.backward(job.node_id, job.batch_id)
+        elif job.work == StepWork.OPTIMIZER_STEP:
+            self.optimizer_step(job.node_id, job.batch_id)
 
     def compile_submod(self, submod, args):
         args = tree_map(to_device, args)
@@ -205,7 +219,22 @@ class RPCWorker:
 
         self.stage_mod = wrapper
 
-    def forward(self, batch_no, *args):
+    def send_act(self, node_id, batch_id):
+        pass
+
+    def recv_act(self, node_id, batch_id):
+        pass
+
+    def send_grad(self, node_id, batch_id):
+        pass
+
+    def recv_grad(self, node_id, batch_id):
+        pass
+
+    def optimizer_step(self, node_id, batch_id):
+        pass
+
+    def forward(self, node_id, batch_id):
         if self.rank == 0:
             args = [a.to(self.device) for a in args]
         else:
@@ -234,7 +263,7 @@ class RPCWorker:
 
         return loss_cpu
 
-    def backward(self, batch_no, grads):
+    def backward(self, node_id, batch_id):
         if grads is not None:
             grads = [a.to(self.device) for a in grads]
 

@@ -100,23 +100,27 @@ class PipeGraphRunner(nn.Module):
         mods = get_submodules(gm)
         self.sched.assign_train_steps_to_workers(mods)
 
+        input_rank = self.graph.input_node.rank
+        output_rank = self.graph.output_node.rank
+        self.in_worker = self.workers[input_rank - 1]
+        self.out_worker = self.workers[output_rank - 1]
+
+        self.out_worker.rpc_sync().set_loss_fn(manager.loss_fn)
+
     def forward(self, *args, **kwargs):
+        # TODO: fire workers from here if there is multiple runners
+
         # return Future[Token]
         batch_no = self.manager.get_batch_no()
 
-        input_rank = self.graph.input_node.rank
-        output_rank = self.graph.output_node.rank
-        in_worker = self.workers[input_rank - 1]
-        out_worker = self.workers[output_rank - 1]
-
-        in_worker.rpc_sync().set_input(batch_no, args, kwargs)
+        self.in_worker.rpc_sync().set_input(batch_no, args, kwargs)
 
         output_token = (
-            out_worker.rpc_async().get_io_token(batch_no)
+            self.out_worker.rpc_async().get_io_token(batch_no)
             if self.manager.is_train
             else None
         )
-        backward_token = in_worker.rpc_async().get_io_token(batch_no)
+        backward_token = self.in_worker.rpc_async().get_io_token(batch_no)
 
         return PipeTensor(batch_no, output_token, backward_token)
 
@@ -142,7 +146,6 @@ class PipeManager:
         self.batch_cnt = option.batch_cnt
         self.device_cnt = option.device_cnt
 
-        self.runner = None
         self.scheduler = get_scheduler(option.scheduler)
 
         # TODO: split by other strategies
@@ -221,7 +224,6 @@ class PipeManager:
             print(split_gm.graph)
 
             runner = PipeGraphRunner(self, split_gm)
-            self.runner = runner
 
             return runner
 
