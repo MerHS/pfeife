@@ -1,10 +1,7 @@
 import operator
 from typing import Dict, List
 
-from torch.distributed.rpc import PyRRef
 from torch.fx import GraphModule, Node
-
-from .rpc_worker import RPCWorker
 
 
 class PipeNode:
@@ -101,7 +98,11 @@ class PipeGraph:
                 src_node.append_out(edge)
                 self.edge_dict[node.name] = edge
             elif node.op == "output":
-                for idx, arg in enumerate(node.args):
+                args = node.args[0]
+                if type(args) != tuple:
+                    args = [args]
+
+                for idx, arg in enumerate(args):
                     if arg.name in self.node_dict:
                         in_node = self.node_dict[arg.name]
                         edge = PipeEdge(in_node)

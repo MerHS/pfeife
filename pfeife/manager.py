@@ -8,7 +8,7 @@ import torch.nn as nn
 from torch.nn.modules.loss import _Loss
 from torch.distributed.rpc import PyRRef
 
-from .batch import send_value, split_args_kwargs
+from .batch import split_args_kwargs
 from .graph_split import ParamSplit
 from .loss import LossWrapper
 from .option import PipeOption
@@ -20,11 +20,23 @@ from .utils import get_logger
 log = get_logger()
 
 
+def fetch_attr(module, target: str):
+    target_atoms = target.split(".")
+    attr_itr = module
+    for i, atom in enumerate(target_atoms):
+        if not hasattr(attr_itr, atom):
+            raise RuntimeError(
+                f"Node referenced nonexistent target {'.'.join(target_atoms[:i])}"
+            )
+        attr_itr = getattr(attr_itr, atom)
+    return attr_itr
+
+
 def get_submodules(gm: fx.GraphModule):
     mods = []
     for node in gm.graph.nodes:
         if node.op == "call_module":
-            mods.append(node.target)
+            mods.append(fetch_attr(gm, node.target))
     return mods
 
 
@@ -93,11 +105,14 @@ class PipeGraphRunner(nn.Module):
         super().__init__()
 
         self.manager = manager
-        self.graph = PipeGraph(len(manager.rpc_workers))
+        self.graph = PipeGraph(len(manager.rpc_workers), gm)
         self.sched = manager.scheduler(manager.batch_cnt, self.graph)
         self.workers = manager.rpc_workers
 
+        manager.graph = self.graph
+
         mods = get_submodules(gm)
+        mods = [mod.to("cpu") for mod in mods]
         self.sched.assign_train_steps_to_workers(manager.rpc_workers, mods)
 
         input_rank = self.graph.input_node.rank
@@ -122,7 +137,9 @@ class PipeGraphRunner(nn.Module):
         )
         backward_token = self.in_worker.rpc_async().get_io_token(batch_no)
 
-        return PipeTensor(batch_no, output_token, backward_token)
+        return [
+            PipeTensor(batch_no, output_token, backward_token),
+        ]
 
 
 class PipeManager:
@@ -137,6 +154,7 @@ class PipeManager:
         self.loss_fn = loss_fn
         self.batch_no = 0
         self.is_train = True
+        self.graph = None
 
         self.set_option(option)
         self._compile()
@@ -145,11 +163,12 @@ class PipeManager:
         self.stage_cnt = option.stage_cnt
         self.batch_cnt = option.batch_cnt
         self.device_cnt = option.device_cnt
+        self.split_cnt = option.stage_cnt
 
         self.scheduler = get_scheduler(option.scheduler)
 
         # TODO: split by other strategies
-        self.splitter = ParamSplit(self.stage_cnt)
+        self.splitter = ParamSplit()
 
         # TODO: check this will remove (GC-out) worker objects
         self.rpc_workers: List[PyRRef] = []
@@ -170,7 +189,7 @@ class PipeManager:
             # TODO: what if this function is called two times from a training loop?
 
             qualname_map = {}
-            split_gm = self.splitter.split(gm, qualname_map)
+            split_gm = self.splitter.split(gm, self.stage_cnt, qualname_map)
 
             def delete_user_reference(node, user, delete_node=True):
                 assert len(user.kwargs) == 0
@@ -263,15 +282,15 @@ class PipeManager:
         # TODO: evaluation pass
         self.init_runner()
 
-        args, kwargs = split_args_kwargs(args, kwargs, self.batch_split)
-        targets, _ = split_args_kwargs([target], dict(), self.batch_split)
+        args, kwargs = split_args_kwargs(args, kwargs, self.batch_cnt)
+        targets, _ = split_args_kwargs([target], dict(), self.batch_cnt)
 
         # TODO: Custom Tensor model
         tokens: List[PipeTensor] = []
         for micro_args, micro_kwargs in zip(args, kwargs):
             tokens.append(self.opt_model(*micro_args, **micro_kwargs))
 
-        out_rank = self.runner.graph.output_node.rank
+        out_rank = self.graph.output_node.rank
         out_worker = self.rpc_workers[out_rank - 1]
         for batch_id, target in enumerate(targets):
             out_worker.rpc_sync().set_target(batch_id, target)

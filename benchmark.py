@@ -11,6 +11,7 @@ from torch.profiler import ProfilerActivity, profile
 from pfeife import PipeManager, run_master
 from pfeife.loss import SumLoss
 from pfeife.utils import get_logger
+from pfeife.option import PipeOption
 
 log = get_logger()
 
@@ -37,7 +38,7 @@ def profile_model(model_iter_fn, model, inputs):
             prof.step()
 
 
-def run_model(args, model, inputs):
+def run_model(args, model, inputs, option):
     # def move_tensor(maybe_tensor):
     #     if torch.is_tensor(maybe_tensor):
     #         return maybe_tensor.to(dev_rank)
@@ -45,21 +46,11 @@ def run_model(args, model, inputs):
     # inputs = pytree.tree_map(move_tensor, inputs)
 
     dynamo.reset()
+
     if args.verbose:
         dynamo.config.verbose = True
         dynamo.config.log_level = logging.DEBUG
         log.setLevel(logging.INFO)
-
-    backend = args.backend
-    if args.backend == "print":
-
-        def print_compile(gm, ex):
-            print(
-                f"print_compile:\n{str(gm.graph)}\n-----------------------------------------"
-            )
-            return gm
-
-        backend = print_compile
 
     def model_iter_fn(model, example_inputs, collect_outputs=False):
         target = torch.rand(args.batch_size, 10)
@@ -68,13 +59,7 @@ def run_model(args, model, inputs):
         if collect_outputs:
             return outputs
 
-    pipe = PipeManager(
-        model,
-        loss_fn=SumLoss(),
-        dynamo_backend=backend,
-        pipe_split=args.pipe_split,
-        batch_split=args.batch_split,
-    )
+    pipe = PipeManager(model, loss_fn=SumLoss(), option=option)
     pipe.train()
 
     # warmup
@@ -93,12 +78,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--backend",
-        default="eager",
-        help="if set to a str, uses dynamo[str] backend. else, eager",
+        default="aot_eager",
+        help="if set to a str, uses dynamo[str] backend. else, aot_eager",
     )
+    parser.add_argument("--scheduler", default="gpipe")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--device_cnt", type=int, default=2)
     parser.add_argument("--pipe_split", type=int, default=2)
     parser.add_argument("--batch_split", type=int, default=4)
     parser.add_argument("--repeat", default=5, type=int, help="Repeats for timing run")
@@ -110,12 +97,25 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    option = PipeOption(
+        compiler=args.backend,
+        scheduler=args.scheduler,
+        device_cnt=args.device_cnt,
+        stage_cnt=args.pipe_split,
+        batch_cnt=args.batch_split,
+        verbosity="debug" if args.verbose else "info",
+    )
+
     model_name = args.model
 
     print(f"================ run {model_name} ================")
 
     model, inputs = get_model(args.model, args.batch_size)
-    print(f"input shape: {inputs[0].shape}")
-    args.batch_size = inputs[0].shape[0]
+    model = model.to("cpu")
+    inputs = [i.to("cpu") for i in inputs]
 
-    run_master(run_model, (args, model, inputs), pipe_split=args.pipe_split)
+    print(f"input shape: {inputs[0].shape}")
+    if args.batch_size == None:
+        args.batch_size = inputs[0].shape[0]
+
+    run_master(run_model, args=(args, model, inputs, option), option=option)

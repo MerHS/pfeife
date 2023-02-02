@@ -1,3 +1,5 @@
+import logging
+
 default_optimizer = dict(type="adam", lr=1e-3)
 
 
@@ -13,6 +15,7 @@ class PipeOption:
     'batch_cnt' (int): number of microbatches (default: 4)
     'device_cnt' (int): number of usable GPU devices (default: 2)
     'stage_cnt' (int): numbers of pipeline stages (default: same as device_cnt)
+    'verbosity' (str): 'error', 'warning', 'info', 'debug',
     """
 
     def __init__(self, **kwargs):
@@ -22,9 +25,19 @@ class PipeOption:
         self.device_cnt = kwargs.get("device_cnt", 2)
         self.stage_cnt = kwargs.get("stage_cnt", self.device_cnt)
         self.splitter = kwargs.get("splitter", "param")
+        self.verbosity = kwargs.get("verbosity", "warning")
+
+        if self.verbosity == "error":
+            self.verbosity = logging.ERROR
+        elif self.verbosity == "info":
+            self.verbosity = logging.INFO
+        elif self.verbosity == "debug":
+            self.verbosity = logging.DEBUG
+        else:
+            self.verbosity = logging.WARNING
 
         optimizer = kwargs.get("optimizer", default_optimizer)
-        self.optimzier_type = optimizer.setdefault("type", "adam")
+        self.optimizer_type = optimizer.setdefault("type", "adam")
 
         opt_kwargs = optimizer.copy()
         del opt_kwargs["type"]

@@ -1,6 +1,6 @@
 from typing import List, Tuple
 from enum import Enum
-from dataclass import dataclass
+from dataclasses import dataclass
 
 import torch
 from torch.distributed.rpc import PyRRef

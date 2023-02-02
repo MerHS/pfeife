@@ -7,16 +7,12 @@ import torch.optim as optim
 from torch._dynamo.optimizations import BACKENDS
 from torch._inductor.compile_fx import compile_fx
 from torch.distributed.rpc import PyRRef
-from torch.fx import Node
-from torch.utils._pytree import tree_flatten, tree_map
+from torch.utils._pytree import tree_map
 
 from .option import PipeOption
 from .scheduler import Step, StepWork
 from .utils import to_device
-from .pipe_graph import PipeNode, PipeIO, PipeEdge
-
-if TYPE_CHECKING:
-    from .pipe_graph import PipeGraph
+from .pipe_graph import PipeNode, PipeGraph
 
 
 class WrapperModule(torch.nn.Module):
@@ -61,13 +57,6 @@ class RPCWorker:
         self.add_lock("io_data")
         # handle communication. (fw act / bw grad)
         self.add_lock("fb_comm")
-
-        if type(self.compiler) == str:
-            if self.compiler == "inductor":
-                torch._inductor.config.triton.cudagraphs = False
-                self.compiler = compile_fx
-            else:
-                self.compiler = BACKENDS[self.compiler]
 
         self.optimizer = None
         self.optimizer_cls = (
@@ -194,7 +183,7 @@ class RPCWorker:
         cv = self.get_lock("job_queue")
         while True:
             with cv:
-                self.cv.wait_for(lambda: len(self.job_queue) > 0)
+                cv.wait_for(lambda: len(self.job_queue) > 0)
                 job = self.job_queue.pop(0)
 
             # synchronous handle job
@@ -219,6 +208,12 @@ class RPCWorker:
             self.optimizer_step(node, job.batch_id)
 
     def compile_submod(self, submod, args):
+        if self.compiler == "inductor":
+            torch._inductor.config.triton.cudagraphs = False
+            compiler = compile_fx
+        else:
+            compiler = BACKENDS[self.compiler]
+
         args = tree_map(to_device, args)
 
         unwrap_singleton_tuple = False
@@ -230,7 +225,7 @@ class RPCWorker:
         submod.recompile()
 
         wrapper = WrapperModule(
-            self.compiler(submod, args),
+            compiler(submod, args),
             unwrap_singleton_tuple,
         )
 
@@ -304,7 +299,7 @@ class RPCWorker:
 
         input_keys = []
         for edge in node.in_edges:
-            comm_id = self.get_comm_id(edge.start_node.id, curr_id, edge.idx, batch_id)
+            comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             input_keys.append(comm_id)
 
         def checker():
@@ -364,7 +359,7 @@ class RPCWorker:
         curr_id = node.idx
         inputs = []
         for edge in node.in_edges:
-            comm_id = self.get_comm_id(edge.start_node.id, curr_id, edge.idx, batch_id)
+            comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             value = self.fw_inputs[comm_id]
             inputs.append(value)
 
@@ -378,13 +373,28 @@ class RPCWorker:
         result = mod(*inputs)
 
         # TODO: multi-node output node
-        if self.loss_fn is not None:
+
+        is_end_node = False
+        for edge in node.out_edges:
+            for out_node in edge.end_nodes:
+                if out_node.is_io:
+                    is_end_node = True
+                    break
+        is_end_node = is_end_node and self.loss_fn is not None
+
+        if is_end_node:
             io_cv = self.get_lock("io_data")
             with io_cv:
                 io_cv.wait_for(lambda: self.targets[batch_id] is not None)
                 result = self.loss_fn(result, self.targets[batch_id])
 
         self.fw_results[batch_id] = result
+
+        if is_end_node:
+            token_cv = self.get_lock("io_tokens")
+            with token_cv:
+                self.io_tokens[batch_id] = True
+                token_cv.notify()
 
     def backward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
@@ -407,3 +417,10 @@ class RPCWorker:
             grads.append(comm_id)
 
         torch.autograd.backward(self.fw_results[batch_id], grads)
+
+        # is first node
+        if node.idx == 1:
+            token_cv = self.get_lock("io_tokens")
+            with token_cv:
+                self.io_tokens[batch_id] = True
+                token_cv.notify()
