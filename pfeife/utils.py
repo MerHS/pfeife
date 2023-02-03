@@ -2,11 +2,20 @@ import logging
 import torch
 from torch.utils._pytree import tree_map
 
-_logger = logging.getLogger("pfeife")
+logger = None
 
 
 def get_logger():
-    return _logger
+    global logger
+    if logger is None:
+        logger = logging.getLogger("pfeife")
+        logging.basicConfig()
+    return logger
+
+
+def set_logger_level(level):
+    logger = get_logger()
+    logger.level = level
 
 
 def to_device(value, device):

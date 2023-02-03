@@ -1,3 +1,4 @@
+import logging
 from typing import List, Union
 
 import torch
@@ -108,6 +109,12 @@ class PipeGraphRunner(nn.Module):
         self.graph = PipeGraph(len(manager.rpc_workers), gm)
         self.sched = manager.scheduler(manager.batch_cnt, self.graph)
         self.workers = manager.rpc_workers
+
+        logger = get_logger()
+        if logger.isEnabledFor(logging.DEBUG):
+            graph_str = self.graph.to_str()
+            logger.debug("=====pipeline graph======")
+            logger.debug(graph_str)
 
         manager.graph = self.graph
 

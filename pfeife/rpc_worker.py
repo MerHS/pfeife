@@ -1,5 +1,6 @@
 import threading
-from typing import TYPE_CHECKING, Dict, List
+import logging
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ from torch.utils._pytree import tree_map
 
 from .option import PipeOption
 from .scheduler import Step, StepWork
-from .utils import to_device
+from .utils import to_device, get_logger
 from .pipe_graph import PipeNode, PipeGraph
 
 
@@ -34,6 +35,8 @@ class WrapperModule(torch.nn.Module):
 
 class RPCWorker:
     def __init__(self, rank: int, device: str, option: PipeOption):
+        self.logger = get_logger()
+
         self.option = option
         self.rank = rank
         self.device = device
@@ -77,6 +80,9 @@ class RPCWorker:
             )
         self.optimizer.zero_grad()
 
+    def debug(self, msg):
+        self.logger.debug(f"[Worker {self.rank}] {msg}")
+
     def reset_cache(self):
         self.inputs = [None for _ in range(self.option.batch_cnt)]
         self.targets = [None for _ in range(self.option.batch_cnt)]
@@ -106,10 +112,14 @@ class RPCWorker:
         self.graph = pipe_graph
 
     def set_scheduler_steps(self, steps: List[Step]):
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for i, step in enumerate(steps):
+                self.debug(f"step {i}: {step}")
         self.steps = steps
 
     def set_input(self, batch_id, args, kwargs):
         # TODO: check whether we should handle kwargs
+        self.debug(f"set input for batch {batch_id}")
         io_cv = self.get_lock("io_data")
         with io_cv:
             self.inputs[batch_id] = args
@@ -122,6 +132,7 @@ class RPCWorker:
                 value = args[edge.idx] if edge.idx is not None else args
                 for end_node in edge.end_nodes:
                     comm_id = self.get_comm_id(0, end_node.idx, edge.idx, batch_id)
+                    self.debug(f"input id for batch {batch_id}: {comm_id}")
                     self.fw_inputs[comm_id] = value
             comm_cv.notify()
 
@@ -132,13 +143,16 @@ class RPCWorker:
             cv.notify()
 
     def get_io_token(self, batch_id):
+        self.debug(f"create IO token for {batch_id}")
         cv = self.get_lock("io_tokens")
         with cv:
             cv.wait_for(lambda: self.io_tokens[batch_id] is not None)
+            self.debug(f"resolve token for {batch_id}")
             return self.io_tokens[batch_id]
 
     def get_loss(self, reduce="sum"):
         # reduce: 'sum', 'average', None (return list of losses)
+        self.debug("create loss token")
         cv = self.get_lock("io_tokens")
         with cv:
             cv.wait_for(lambda: all([loss is not None for loss in self.losses]))
@@ -148,6 +162,8 @@ class RPCWorker:
                 loss = torch.mean(self.losses)
             else:
                 loss = self.losses
+
+            self.debug("return loss")
             return loss
 
     def set_output(self, batch_id, output_value):
@@ -174,6 +190,7 @@ class RPCWorker:
                 mod.eval()
 
     def fire(self):
+        self.debug("activated")
         cv = self.get_lock("job_queue")
         with cv:
             self.job_queue = [job for job in self.steps]
@@ -190,6 +207,7 @@ class RPCWorker:
             self.handle_job(job)
 
     def handle_job(self, job: Step):
+        self.debug("handles {job}")
         node = self.graph.internal_nodes[job.node_id]
 
         if job.work == StepWork.SEND_ACT:
@@ -235,12 +253,14 @@ class RPCWorker:
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
 
     def push_fw_act(self, key: str, value):
+        self.debug(f"push forward activation: {key}")
         cv = self.get_lock("fb_comm")
         with cv:
             self.fw_inputs[key] = value
             cv.notify()
 
     def push_bw_grad(self, key: str, value):
+        self.debug(f"push backward gradient: {key}")
         cv = self.get_lock("fb_comm")
         with cv:
             self.bw_grads[key] = value
@@ -301,6 +321,12 @@ class RPCWorker:
         for edge in node.in_edges:
             comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             input_keys.append(comm_id)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for comm_id in input_keys:
+                self.debug(
+                    f"<RECV_ACT> requires '{comm_id}' :{'' if comm_id in self.fw_inputs else ' not'} found"
+                )
 
         def checker():
             for key in input_keys:
@@ -366,6 +392,7 @@ class RPCWorker:
         mod = self.mods[curr_id]
 
         if curr_id not in self.mod_compiled:
+            self.logger.debug(f"[Worker {self.rank}] compiles it submodule {curr_id}")
             mod = self.compile_submod(self.mods[curr_id], inputs)
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)

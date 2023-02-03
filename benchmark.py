@@ -47,10 +47,10 @@ def run_model(args, model, inputs, option):
 
     dynamo.reset()
 
-    if args.verbose:
-        dynamo.config.verbose = True
-        dynamo.config.log_level = logging.DEBUG
-        log.setLevel(logging.INFO)
+    # if args.verbose:
+    #     dynamo.config.verbose = True
+    #     dynamo.config.log_level = logging.DEBUG
+    #     log.setLevel(logging.INFO)
 
     def model_iter_fn(model, example_inputs, collect_outputs=False):
         target = torch.rand(args.batch_size, 10)

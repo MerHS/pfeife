@@ -105,7 +105,7 @@ class ParamSplit(GraphSplitter):
 
         log = get_logger()
 
-        if log.level == logging.INFO:
+        if log.isEnabledFor(logging.DEBUG):
             debug_str = (
                 f"\n---orig graph---\n{gm.graph}\n"
                 + f"\n---split graph---\n{split_gm.graph}\n"
@@ -115,6 +115,6 @@ class ParamSplit(GraphSplitter):
                     # only print the submod graphs, not their children
                     debug_str += f"\n---{name} graph---\n{module.graph}\n"
             debug_str += "\n---------------\n"
-            log.info(debug_str)
+            log.debug(debug_str)
 
         return split_gm

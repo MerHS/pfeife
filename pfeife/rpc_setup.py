@@ -5,6 +5,7 @@ import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
 from .option import PipeOption
+from .utils import set_logger_level
 
 
 def get_rpc_name(rank):
@@ -57,6 +58,8 @@ def run_local(rank, main_fn, args, option):
     )
 
     # dist.init_process_group("nccl", world_size=world_size, rank=rank, group=dist_group)
+
+    set_logger_level(option.verbosity)
 
     if rank == 0:
         main_fn(*args)

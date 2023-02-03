@@ -31,6 +31,26 @@ class PipeNode:
     def set_device(self, device: str):
         self.device = device
 
+    def to_str_tuple(self):
+        if self.is_io:
+            return f"[{self.idx}, {self.rank}]"
+        else:
+            return f"({self.idx}, {self.rank})"
+
+    def to_str(self):
+        s = self.to_str_tuple()
+        indent = len(s) + 4
+        for i, e in enumerate(self.in_edges):
+            s += " <- " if i == 0 else ("\n" + " " * indent)
+            s += f"{e.start_node.to_str_tuple()} <{e.idx}> "
+        for i, e in enumerate(self.out_edges):
+            if i == 0 and len(self.in_edges) > 0:
+                s += "\n" + " " * (indent - 4)
+            for j, n in enumerate(e.end_nodes):
+                s += " -> " if (i + j) == 0 else ("\n" + " " * indent)
+                s += f"{n.to_str_tuple()} <{e.idx}> "
+        return s
+
 
 class PipeEdge:
     def __init__(self, start_node: PipeNode, item_idx=None):
@@ -48,6 +68,14 @@ class PipeGraph:
 
         if gm is not None:
             self.build_graph(gm)
+
+    def to_str(self):
+        str_list = [self.input_node.to_str()]
+        for n in self.internal_nodes:
+            str_list.append(n.to_str())
+        str_list.append(self.output_node.to_str())
+
+        return "\n".join(str_list)
 
     def build_graph(self, gm: GraphModule):
         self.input_node = PipeNode(0, 0, is_io=True)
