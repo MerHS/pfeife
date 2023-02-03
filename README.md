@@ -15,6 +15,6 @@ python install.py
 # Run benchmarks 
 cd ../pfeife
 
-## Single benchmark (ViT-L, pipelined with aot_eager compiler)
-python benchmark.py --model timm_vision_transformer_large --batch_size 4 --backend aot_eager
+## Single benchmark (VGG16, pipelined with aot_eager compiler)
+python benchmark.py --model vgg16 --verbose
 ```

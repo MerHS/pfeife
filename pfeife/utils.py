@@ -20,7 +20,7 @@ def set_logger_level(level):
 
 def to_device(value, device):
     def _map_device(value):
-        if torch.is_tensor(value):
+        if torch.is_tensor(value) or isinstance(value, torch.nn.Module):
             return value.to(device)
         else:
             return value

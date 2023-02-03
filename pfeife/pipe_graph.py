@@ -92,7 +92,7 @@ class PipeGraph:
                 edge = PipeEdge(self.input_node, input_cnt)
                 input_cnt += 1
                 self.edge_dict[node.name] = edge
-                self.output_node.append_out(edge)
+                self.input_node.append_out(edge)
             elif node.op == "call_module":  # worker
                 node_cnt += 1
                 rank = (node_cnt // self.worker_cnt) + 1

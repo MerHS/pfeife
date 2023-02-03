@@ -108,18 +108,24 @@ class RPCWorker:
     def set_workers(self, workers: List[PyRRef]):
         self.workers = workers
 
+    def ping(self, msg):
+        self.debug(f"got {msg} from {self.rank}")
+
     def set_graph(self, pipe_graph: PipeGraph):
         self.graph = pipe_graph
 
     def set_scheduler_steps(self, steps: List[Step]):
         if self.logger.isEnabledFor(logging.DEBUG):
             for i, step in enumerate(steps):
-                self.debug(f"step {i}: {step}")
+                self.debug(f"set step {i}: {step}")
         self.steps = steps
 
     def set_input(self, batch_id, args, kwargs):
         # TODO: check whether we should handle kwargs
         self.debug(f"set input for batch {batch_id}")
+
+        args = to_device(args, self.device)
+
         io_cv = self.get_lock("io_data")
         with io_cv:
             self.inputs[batch_id] = args
@@ -190,7 +196,7 @@ class RPCWorker:
                 mod.eval()
 
     def fire(self):
-        self.debug("activated")
+        self.debug(f"activate worker {self.rank} from device {self.device}")
         cv = self.get_lock("job_queue")
         with cv:
             self.job_queue = [job for job in self.steps]
@@ -207,7 +213,7 @@ class RPCWorker:
             self.handle_job(job)
 
     def handle_job(self, job: Step):
-        self.debug("handles {job}")
+        self.debug(f"start {job}")
         node = self.graph.internal_nodes[job.node_id]
 
         if job.work == StepWork.SEND_ACT:
@@ -232,8 +238,6 @@ class RPCWorker:
         else:
             compiler = BACKENDS[self.compiler]
 
-        args = tree_map(to_device, args)
-
         unwrap_singleton_tuple = False
         for sn in submod.graph.nodes:
             if sn.op == "output":
@@ -253,14 +257,14 @@ class RPCWorker:
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
 
     def push_fw_act(self, key: str, value):
-        self.debug(f"push forward activation: {key}")
+        self.debug(f"received forward activation: {key}")
         cv = self.get_lock("fb_comm")
         with cv:
             self.fw_inputs[key] = value
             cv.notify()
 
     def push_bw_grad(self, key: str, value):
-        self.debug(f"push backward gradient: {key}")
+        self.debug(f"received backward gradient: {key}")
         cv = self.get_lock("fb_comm")
         with cv:
             self.bw_grads[key] = value
@@ -301,6 +305,10 @@ class RPCWorker:
                         curr_id, end_node.idx, edge.idx, batch_id
                     )
 
+                    self.debug(
+                        f"<SEND_ACT> send to id {comm_id} (node: {end_node.idx} / rank: {end_node.rank})"
+                    )
+
                     if edge.idx is not None:
                         value_send = value[edge.idx]
                     else:
@@ -325,7 +333,7 @@ class RPCWorker:
         if self.logger.isEnabledFor(logging.DEBUG):
             for comm_id in input_keys:
                 self.debug(
-                    f"<RECV_ACT> requires '{comm_id}' :{'' if comm_id in self.fw_inputs else ' not'} found"
+                    f"<RECV_ACT> requires '{comm_id}' : {'found' if comm_id in self.fw_inputs else 'not found, wait for input'}"
                 )
 
         def checker():
@@ -392,8 +400,8 @@ class RPCWorker:
         mod = self.mods[curr_id]
 
         if curr_id not in self.mod_compiled:
-            self.logger.debug(f"[Worker {self.rank}] compiles it submodule {curr_id}")
-            mod = self.compile_submod(self.mods[curr_id], inputs)
+            self.debug(f"compile submodule {curr_id}, input device: {inputs[0].device}")
+            mod = self.compile_submod(mod, inputs)
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)
 

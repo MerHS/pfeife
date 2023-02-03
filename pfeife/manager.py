@@ -114,7 +114,7 @@ class PipeGraphRunner(nn.Module):
         if logger.isEnabledFor(logging.DEBUG):
             graph_str = self.graph.to_str()
             logger.debug("=====pipeline graph======")
-            logger.debug(graph_str)
+            logger.debug("\n" + graph_str)
 
         manager.graph = self.graph
 

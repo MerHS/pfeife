@@ -37,14 +37,16 @@ def run_local(rank, main_fn, args, option):
     # dist_group = "master" if rank == 0 else "worker"
 
     device_map = dict()
-    main_device = "cpu" if rank == 0 else f"cuda:{rank}"
+    main_device = "cpu" if rank == 0 else f"cuda:{rank - 1}"
 
     for next_rank in range(1, world_size):
         if next_rank == rank:
             continue
-        device_map[get_rpc_name(next_rank)] = {main_device: f"cuda:{next_rank}"}
+        device_map[get_rpc_name(next_rank)] = {main_device: f"cuda:{next_rank - 1}"}
         # if rank == 0:
         #     device_map[get_rpc_name(next_rank)]["cuda:0"] = f"cuda:{next_rank}"
+
+    print(f"device map for {rank}: {device_map}")
 
     options = rpc.TensorPipeRpcBackendOptions(
         num_worker_threads=512, device_maps=device_map
