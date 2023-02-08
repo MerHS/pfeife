@@ -166,6 +166,10 @@ class PipeManager:
         self.set_option(option)
         self._compile()
 
+    def __del__(self):
+        for worker in self.clear_workers():
+            worker.rpc_sync().clear_workers()
+
     def set_option(self, option: PipeOption):
         self.stage_cnt = option.stage_cnt
         self.batch_cnt = option.batch_cnt
@@ -304,7 +308,7 @@ class PipeManager:
 
         # ignite worker (add jobs to job queue)
         for worker in self.rpc_workers:
-            worker.rpc_sync().fire()
+            worker.rpc_async().fire()
 
         # run and wait tokens
         for pt in tokens:

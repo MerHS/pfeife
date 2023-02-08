@@ -29,6 +29,9 @@ class Step:
     node_id: int
     batch_id: int
 
+    def __str__(self):
+        return f"{self.work} / (node {self.node_id} of batch {self.batch_id})"
+
 
 class Scheduler:
     """

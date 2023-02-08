@@ -32,6 +32,9 @@ class WrapperModule(torch.nn.Module):
             return x[0]
         return x
 
+    def parameters(self):
+        return self.compiled_submod.parameters()
+
 
 class RPCWorker:
     def __init__(self, rank: int, device: str, option: PipeOption):
@@ -47,6 +50,7 @@ class RPCWorker:
 
         self.graph = None
         self.optimizer = None
+        self.params = []
 
         self.is_train = True
 
@@ -73,10 +77,13 @@ class RPCWorker:
         )
         self.run_loop.start()
 
+    def clear_workers(self):
+        self.workers = []
+
     def _init_optimizer(self):
         if self.optimizer is None:
             self.optimizer = self.optimizer_cls(
-                self.stage_mod.parameters(), **self.option.optimizer_kwargs
+                self.params, **self.option.optimizer_kwargs
             )
         self.optimizer.zero_grad()
 
@@ -163,9 +170,9 @@ class RPCWorker:
         with cv:
             cv.wait_for(lambda: all([loss is not None for loss in self.losses]))
             if reduce == "sum":
-                loss = torch.sum(self.losses)
+                loss = torch.sum(torch.stack(self.losses))
             elif reduce == "average":
-                loss = torch.mean(self.losses)
+                loss = torch.mean(torch.stack(self.losses))
             else:
                 loss = self.losses
 
@@ -180,6 +187,7 @@ class RPCWorker:
 
     def set_module(self, mod_id, module):
         self.mods[mod_id + 1] = module.to(self.device)
+        self.params.extend(list(module.parameters()))
 
     def get_device(self):
         return self.device
@@ -373,8 +381,16 @@ class RPCWorker:
         grad_keys = []
         for edge in node.out_edges:
             for end_node in edge.end_nodes:
+                if end_node == self.graph.output_node:
+                    continue
                 comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
                 grad_keys.append(comm_id)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            for comm_id in grad_keys:
+                self.debug(
+                    f"<RECV_GRAD> requires '{comm_id}' : {'found' if comm_id in self.bw_grads else 'not found, wait for input'}"
+                )
 
         def checker():
             for key in grad_keys:
@@ -422,6 +438,7 @@ class RPCWorker:
             with io_cv:
                 io_cv.wait_for(lambda: self.targets[batch_id] is not None)
                 result = self.loss_fn(result, self.targets[batch_id])
+                self.losses[batch_id] = result
 
         self.fw_results[batch_id] = result
 
@@ -441,15 +458,16 @@ class RPCWorker:
                 break
 
             grad = None
+            # TODO: reduce properly (regarding edge idx)
             for end_node in edge.end_nodes:
                 comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
                 comm_grad = self.bw_grads[comm_id]
-                # TODO: reduce properly
+
                 if grad is None:
                     grad = comm_grad
                 else:
                     grad += comm_grad
-            grads.append(comm_id)
+            grads.append(grad)
 
         torch.autograd.backward(self.fw_results[batch_id], grads)
 
@@ -458,4 +476,6 @@ class RPCWorker:
             token_cv = self.get_lock("io_tokens")
             with token_cv:
                 self.io_tokens[batch_id] = True
+                token_cv.notify()
+                # TODO: why should we notify twice?
                 token_cv.notify()
