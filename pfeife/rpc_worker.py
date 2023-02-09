@@ -1,39 +1,18 @@
-import threading
 import logging
+import threading
 from typing import Dict, List
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch._dynamo.optimizations import BACKENDS
-from torch._inductor.compile_fx import compile_fx
 from torch.distributed.rpc import PyRRef
 from torch.utils._pytree import tree_map
 
+from .compile import compile_module
 from .option import PipeOption
+from .pipe_graph import PipeGraph, PipeNode
 from .scheduler import Step, StepWork
-from .utils import to_device, get_logger
-from .pipe_graph import PipeNode, PipeGraph
-
-
-class WrapperModule(torch.nn.Module):
-    def __init__(self, compiled_submod, unwrap_singleton_tuple):
-        super().__init__()
-        self.compiled_submod = compiled_submod
-        self.unwrap_singleton_tuple = unwrap_singleton_tuple
-
-    def forward(self, *args):
-        x = self.compiled_submod(*args)
-        # TODO(whc)
-        # for some reason the isinstance check is necessary if I split one node per submod
-        # - even though I supposedly wrapped the output in a tuple in those cases, the real
-        # compiled module was still returning a tensor
-        if self.unwrap_singleton_tuple and isinstance(x, (tuple, list)):
-            return x[0]
-        return x
-
-    def parameters(self):
-        return self.compiled_submod.parameters()
+from .utils import get_logger, to_device
 
 
 class RPCWorker:
@@ -89,6 +68,9 @@ class RPCWorker:
 
     def debug(self, msg):
         self.logger.debug(f"[Worker {self.rank}] {msg}")
+
+    def info(self, msg):
+        self.logger.info(f"[Worker {self.rank}] {msg}")
 
     def reset_cache(self):
         self.inputs = [None for _ in range(self.option.batch_cnt)]
@@ -186,6 +168,7 @@ class RPCWorker:
         self.loss_fn = loss_fn
 
     def set_module(self, mod_id, module):
+        # self.info(f"got module of device {next(module.parameters()).device}. send to {self.device}")
         self.mods[mod_id + 1] = module.to(self.device)
         self.params.extend(list(module.parameters()))
 
@@ -238,28 +221,6 @@ class RPCWorker:
             self.backward(node, job.batch_id)
         elif job.work == StepWork.OPTIMIZER_STEP:
             self.optimizer_step(node, job.batch_id)
-
-    def compile_submod(self, submod, args):
-        if self.compiler == "inductor":
-            torch._inductor.config.triton.cudagraphs = False
-            compiler = compile_fx
-        else:
-            compiler = BACKENDS[self.compiler]
-
-        unwrap_singleton_tuple = False
-        for sn in submod.graph.nodes:
-            if sn.op == "output":
-                if not isinstance(sn.args[0], tuple):
-                    unwrap_singleton_tuple = True
-                    sn.args = (sn.args,)
-        submod.recompile()
-
-        wrapper = WrapperModule(
-            compiler(submod, args),
-            unwrap_singleton_tuple,
-        )
-
-        return wrapper
 
     def get_comm_id(self, start_id: int, end_id: int, edge_id: int, batch_id: int):
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
@@ -417,7 +378,7 @@ class RPCWorker:
 
         if curr_id not in self.mod_compiled:
             self.debug(f"compile submodule {curr_id}, input device: {inputs[0].device}")
-            mod = self.compile_submod(mod, inputs)
+            mod = compile_module(self.compiler, mod, inputs)
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)
 

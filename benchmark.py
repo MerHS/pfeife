@@ -12,6 +12,7 @@ from pfeife import PipeManager, run_master
 from pfeife.loss import SumLoss
 from pfeife.utils import get_logger
 from pfeife.option import PipeOption
+from pfeife.compile import compile_module
 
 log = get_logger()
 
@@ -39,36 +40,43 @@ def profile_model(model_iter_fn, model, inputs):
 
 
 def run_model(args, model, inputs, option):
-    # def move_tensor(maybe_tensor):
-    #     if torch.is_tensor(maybe_tensor):
-    #         return maybe_tensor.to(dev_rank)
-    #     return maybe_tensor
-    # inputs = pytree.tree_map(move_tensor, inputs)
-
     dynamo.reset()
 
-    # if args.verbose:
-    #     dynamo.config.verbose = True
-    #     dynamo.config.log_level = logging.DEBUG
-    #     log.setLevel(logging.INFO)
+    if not args.no_pipe:
+        model = PipeManager(model, loss_fn=SumLoss(), option=option)
 
-    def model_iter_fn(model, example_inputs, collect_outputs=False):
-        target = torch.rand(args.batch_size, 10)
-        outputs = model.run(target, *example_inputs)
+        def model_iter_fn(model, example_inputs, collect_outputs=False):
+            target = torch.rand(args.batch_size, 10)
+            outputs = model.run(target, *example_inputs)
 
-        if collect_outputs:
-            return outputs
+            if collect_outputs:
+                return outputs
 
-    pipe = PipeManager(model, loss_fn=SumLoss(), option=option)
-    pipe.train()
+    else:
+        model = model.cuda()
+
+        optim = torch.optim.Adam(model.parameters())
+        model = torch.compile(model, backend=option.compiler)
+
+        def model_iter_fn(model, example_inputs, collect_outputs=False):
+            inputs = [x.cuda() for x in example_inputs]
+            outputs = model(*inputs)
+            loss = outputs.sum()
+            loss.backward()
+            optim.zero_grad()
+            optim.step()
+            if collect_outputs:
+                return outputs
+
+    model.train()
 
     # warmup
     if args.profile:
-        profile_model(model_iter_fn, pipe, inputs)
+        profile_model(model_iter_fn, model, inputs)
     else:
-        _ = timed(pipe, model_iter_fn, inputs, times=3, return_result=False)
+        _ = timed(model, model_iter_fn, inputs, times=3, return_result=False)
         t_total = timed(
-            pipe, model_iter_fn, inputs, times=args.repeat, return_result=False
+            model, model_iter_fn, inputs, times=args.repeat, return_result=False
         )
 
         print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
@@ -81,6 +89,7 @@ if __name__ == "__main__":
         default="aot_eager",
         help="if set to a str, uses dynamo[str] backend. else, aot_eager",
     )
+    parser.add_argument("--no_pipe", action="store_true")
     parser.add_argument("--scheduler", default="gpipe")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -115,7 +124,10 @@ if __name__ == "__main__":
     inputs = [i.to("cpu") for i in inputs]
 
     print(f"input shape: {inputs[0].shape}")
-    if args.batch_size == None:
+    if args.batch_size is None:
         args.batch_size = inputs[0].shape[0]
 
-    run_master(run_model, args=(args, model, inputs, option), option=option)
+    if args.no_pipe:
+        run_model(args, model, inputs, option)
+    else:
+        run_master(run_model, args=(args, model, inputs, option), option=option)

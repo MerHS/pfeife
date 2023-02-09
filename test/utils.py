@@ -60,7 +60,7 @@ def get_model(model_name, batch_size=None):
     setup_torchbench_cwd()
     module = importlib.import_module(f"torchbenchmark.models.{model_name}")
     benchmark_cls = getattr(module, "Model", None)
-    bm = benchmark_cls(test="train", device="cuda", jit=False, batch_size=batch_size)
+    bm = benchmark_cls(test="train", device="cpu", jit=False, batch_size=batch_size)
     model, inputs = bm.get_module()
 
     return model, inputs
