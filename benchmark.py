@@ -82,6 +82,39 @@ def run_model(args, model, inputs, option):
         print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
 
 
+def run_valid(args, model, inputs, option):
+    dynamo.reset()
+
+    model.train()
+
+    pipe = PipeManager(model, loss_fn=SumLoss(), option=option)
+    target = torch.rand(args.batch_size, 10)
+    pipe_outputs = pipe.run(target, *inputs)
+
+    optim = torch.optim.Adam(model.parameters(), **option.optimizer_kwargs)
+    optim.zero_grad()
+    cpu_outputs = model(*inputs).sum()
+    cpu_outputs.backward()
+    optim.step()
+
+    print(f"first pipe output (sum): {pipe_outputs}")
+    print(f"cpu output (sum): {cpu_outputs}")
+
+    pipe_param, pipe_grad = pipe.rpc_workers[0].rpc_sync().test_param_and_grad()
+    cpu_param = list(model.parameters())[0]
+
+    print(f"pipe param[0]: {pipe_param.reshape(-1)[:5]}")
+    print(f"cpu param[0]: {cpu_param.reshape(-1)[:5]}")
+
+    print(f"pipe param[0] grad: {pipe_grad.reshape(-1)[:5]}")
+    print(f"cpu param[0] grad: {cpu_param.grad.reshape(-1)[:5]}")
+
+    pipe_outputs2 = pipe.run(target, *inputs)
+    cpu_outputs2 = model(*inputs).sum()
+    print(f"second pipe output (sum): {pipe_outputs2}")
+    print(f"second cpu output (sum): {cpu_outputs2}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -93,6 +126,7 @@ if __name__ == "__main__":
     parser.add_argument("--scheduler", default="gpipe")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--check_valid", action="store_true")
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--device_cnt", type=int, default=2)
     parser.add_argument("--pipe_split", type=int, default=2)
@@ -127,7 +161,9 @@ if __name__ == "__main__":
     if args.batch_size is None:
         args.batch_size = inputs[0].shape[0]
 
-    if args.no_pipe:
+    if args.check_valid:
+        run_master(run_valid, args=(args, model, inputs, option), option=option)
+    elif args.no_pipe:
         run_model(args, model, inputs, option)
     else:
         run_master(run_model, args=(args, model, inputs, option), option=option)

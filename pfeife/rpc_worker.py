@@ -56,15 +56,21 @@ class RPCWorker:
         )
         self.run_loop.start()
 
-    def clear_workers(self):
-        self.workers = []
-
     def _init_optimizer(self):
         if self.optimizer is None:
             self.optimizer = self.optimizer_cls(
                 self.params, **self.option.optimizer_kwargs
             )
         self.optimizer.zero_grad()
+
+    def clear_workers(self):
+        self.workers = []
+
+    def parameters(self):
+        return self.params
+
+    def test_param_and_grad(self):
+        return (self.params[0], self.params[0].grad)
 
     def debug(self, msg):
         self.logger.debug(f"[Worker {self.rank}] {msg}")
@@ -188,6 +194,7 @@ class RPCWorker:
 
     def fire(self):
         self.debug(f"activate worker {self.rank} from device {self.device}")
+        self._init_optimizer()
         cv = self.get_lock("job_queue")
         with cv:
             self.job_queue = [job for job in self.steps]
@@ -363,8 +370,8 @@ class RPCWorker:
             cv.wait_for(checker)
 
     def optimizer_step(self, node: PipeNode, batch_id: int):
-        self._init_optimizer()
         self.optimizer.step()
+        torch.cuda.current_stream(self.device).synchronize()
 
     def forward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
@@ -403,6 +410,8 @@ class RPCWorker:
 
         self.fw_results[batch_id] = result
 
+        torch.cuda.current_stream(self.device).synchronize()
+
         if is_end_node:
             token_cv = self.get_lock("io_tokens")
             with token_cv:
@@ -431,6 +440,7 @@ class RPCWorker:
             grads.append(grad)
 
         torch.autograd.backward(self.fw_results[batch_id], grads)
+        torch.cuda.current_stream(self.device).synchronize()
 
         # is first node
         if node.idx == 1:
