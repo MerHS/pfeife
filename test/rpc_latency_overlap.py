@@ -85,9 +85,7 @@ def run_main(base_time):
     m1 = rpc.remote("worker1", MyModule, args=("cuda:1", m2))
     m0 = rpc.remote("worker0", MyModule, args=("cuda:0", m1))
 
-    x = torch.rand(SIZE, SIZE, device="cuda:0", requires_grad=False)
-    torch.cuda.current_stream("cuda:0").synchronize()
-    torch.cuda.synchronize()
+    x = torch.rand(SIZE, SIZE, device="cpu", requires_grad=False)
 
     # warmup
     print("warmup")
@@ -150,11 +148,11 @@ def run_worker(rank, base_time):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    curr_device = "cuda:0" if rank == 0 else f"cuda:{rank - 1}"
+    curr_device = "cpu" if rank == 0 else f"cuda:{rank - 1}"
     proc_name = "master" if rank == 0 else f"worker{rank - 1}"
 
     device_map = {
-        "master": {curr_device: "cuda:0"},
+        "master": {curr_device: "cpu"},
         "worker0": {curr_device: "cuda:0"},
         "worker1": {curr_device: "cuda:1"},
         "worker2": {curr_device: "cuda:2"},

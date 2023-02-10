@@ -6,7 +6,7 @@ import torch
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
-SIZE = 500
+SIZE = 5000
 
 
 class MyModule:
