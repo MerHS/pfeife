@@ -118,7 +118,7 @@ def run_main(base_time):
     print("\n+++ Latency +++")
     print(f"[Master] 20 times Total: {base_end - base_start:8.5f}")
     print(
-        f"[Worker 0] Receive latency (0->0): {s0:8.5f}, async send: {w0:8.5f}, matmul latency: {e0:8.5f}"
+        f"[Worker 0] Receive latency (cpu->0): {s0:8.5f}, async send: {w0:8.5f}, matmul latency: {e0:8.5f}"
     )
     print(
         f"[Worker 1] Receive latency (0->1): {s1:8.5f}, async send: {w1:8.5f}, matmul latency: {e1:8.5f}"

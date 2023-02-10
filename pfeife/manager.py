@@ -90,7 +90,7 @@ def move_param_to_callee(
 
 # TODO: make it a real tensor
 class PipeTensor:
-    def __init__(self, batch_no, output_token, backward_token=None):
+    def __init__(self, batch_no, output_token=None, backward_token=None):
         self.batch_no = batch_no
         self.output_token = output_token
         self.backward_token = backward_token
@@ -136,15 +136,7 @@ class PipeGraphRunner(nn.Module):
 
         self.in_worker.rpc_sync().set_input(batch_no, args, kwargs)
 
-        output_token = (
-            self.out_worker.rpc_async().get_io_token(batch_no)
-            if self.manager.is_train
-            else None
-        )
-
-        return [
-            PipeTensor(batch_no, output_token),
-        ]
+        return [PipeTensor(batch_no)]
 
 
 class PipeManager:
@@ -323,10 +315,10 @@ class PipeManager:
             loops.append(loop)
 
         # run and wait tokens
-        for pt in tokens:
-            pt.output_token.wait()
-            if pt.backward_token is not None:
-                pt.backward_token.wait()
+        # for pt in tokens:
+        #     pt.output_token.wait()
+        #     if pt.backward_token is not None:
+        #         pt.backward_token.wait()
 
         for loop in loops:
             loop.wait()

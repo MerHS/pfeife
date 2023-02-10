@@ -52,14 +52,14 @@ def run_local(rank, main_fn, args, option):
         num_worker_threads=512, device_maps=device_map
     )
 
+    dist.init_process_group("nccl", world_size=world_size, rank=rank)
+
     rpc.init_rpc(
         proc_name,
         rank=rank,
         world_size=world_size,
         rpc_backend_options=options,
     )
-
-    # dist.init_process_group("nccl", world_size=world_size, rank=rank, group=dist_group)
 
     set_logger_level(option.verbosity)
 

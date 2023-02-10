@@ -109,31 +109,33 @@ def run_valid(args, model, inputs, option):
 
     set_seed()
 
+    local_inputs = [x.detach().cuda() for x in inputs]
+    model = model.cuda()
     optim = torch.optim.Adam(model.parameters(), **option.optimizer_kwargs)
     optim.zero_grad()
-    cpu_outputs = model(*inputs).sum()
+    cpu_outputs = model(*local_inputs).sum()
     cpu_outputs.backward()
     optim.step()
 
     print(f"first pipe output (sum): {pipe_outputs}")
-    print(f"cpu output (sum): {cpu_outputs}")
+    print(f"first vanilla output (sum): {cpu_outputs}")
 
     pipe_param, pipe_grad = pipe.rpc_workers[0].rpc_sync().test_param_and_grad()
     cpu_param = list(model.parameters())[0]
 
     print(f"pipe param[0]: {pipe_param.reshape(-1)[:5]}")
-    print(f"cpu param[0]: {cpu_param.reshape(-1)[:5]}")
+    print(f"vanilla param[0]: {cpu_param.reshape(-1)[:5]}")
 
     print(f"pipe param[0] grad: {pipe_grad.reshape(-1)[:5]}")
-    print(f"cpu param[0] grad: {cpu_param.grad.reshape(-1)[:5]}")
+    print(f"vanilla param[0] grad: {cpu_param.grad.reshape(-1)[:5]}")
 
     set_seed()
     pipe_outputs2 = pipe.run(target, *inputs)
 
     set_seed()
-    cpu_outputs2 = model(*inputs).sum()
+    cpu_outputs2 = model(*local_inputs).sum()
     print(f"second pipe output (sum): {pipe_outputs2}")
-    print(f"second cpu output (sum): {cpu_outputs2}")
+    print(f"second vanilla output (sum): {cpu_outputs2}")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.distributed as dist
 from torch.distributed.rpc import PyRRef
 from torch.utils._pytree import tree_map
 
@@ -14,6 +15,20 @@ from .option import PipeOption
 from .pipe_graph import PipeGraph, PipeNode
 from .scheduler import Step, StepWork
 from .utils import get_logger, to_device
+
+
+class WorkerSize:
+    def __init__(self, size):
+        self.size = size
+
+
+class WorkerFuture:
+    def __init__(self, fut, buf):
+        self.fut = fut
+        self.buf = buf
+
+    def wait(self):
+        self.fut.wait()
 
 
 class RPCWorker:
@@ -32,17 +47,9 @@ class RPCWorker:
         self.graph = None
         self.optimizer = None
         self.params = []
+        self.buffers = dict()
 
         self.is_train = True
-
-        self.locks: Dict[str, threading.Condition] = dict()
-
-        # handle io tokens for the master node
-        self.add_lock("io_tokens")
-        # handle io data for the master node
-        self.add_lock("io_data")
-        # handle communication. (fw act / bw grad)
-        self.add_lock("fb_comm")
 
         self.optimizer = None
         self.optimizer_cls = (
@@ -76,17 +83,15 @@ class RPCWorker:
         self.logger.info(f"({t - self.base_time:8.5f})[Worker {self.rank}] {msg}")
 
     def reset_cache(self):
-        self.inputs = [None for _ in range(self.option.batch_cnt)]
         self.targets = [None for _ in range(self.option.batch_cnt)]
         self.losses = [None for _ in range(self.option.batch_cnt)]
-        self.outputs = [None for _ in range(self.option.batch_cnt)]
 
         self.fw_results = dict()
         self.fw_inputs = dict()
         self.bw_grads = dict()
 
-        self.io_tokens = [None for _ in range(self.option.batch_cnt)]
-        self.current_job: Step = None
+        self.key_tags: Dict[str, int] = dict()
+        self.tag_max = 100
 
     def add_lock(self, name):
         lock = threading.Lock()
@@ -111,60 +116,17 @@ class RPCWorker:
                 self.debug(f"set step {i}: {step}")
         self.steps = steps
 
-    def set_input(self, batch_id, args, kwargs):
-        # TODO: check whether we should handle kwargs
-        self.debug(f"set input for batch {batch_id}")
+    def fire(self):
+        self.debug(f"activate worker {self.rank} from device {self.device}")
+        self._init_optimizer()
 
-        args = to_device(args, self.device)
+        job_queue = [job for job in self.steps]
 
-        io_cv = self.get_lock("io_data")
-        with io_cv:
-            self.inputs[batch_id] = args
-            io_cv.notify_all()
+        while len(job_queue) > 0:
+            job = job_queue.pop(0)
 
-        comm_cv = self.get_lock("fb_comm")
-        input_node = self.graph.input_node
-        with comm_cv:
-            for edge in input_node.out_edges:
-                value = args[edge.idx] if edge.idx is not None else args
-                for end_node in edge.end_nodes:
-                    comm_id = self.get_comm_id(0, end_node.idx, edge.idx, batch_id)
-                    self.debug(f"input id for batch {batch_id}: {comm_id}")
-                    self.fw_inputs[comm_id] = value
-            comm_cv.notify_all()
-
-    def set_target(self, batch_id, target):
-        cv = self.get_lock("io_data")
-        with cv:
-            self.targets[batch_id] = target
-            cv.notify_all()
-
-    def get_io_token(self, batch_id):
-        self.debug(f"create IO token for {batch_id}")
-        cv = self.get_lock("io_tokens")
-        with cv:
-            cv.wait_for(lambda: self.io_tokens[batch_id] is not None)
-            self.debug(f"resolve token for {batch_id}")
-            return self.io_tokens[batch_id]
-
-    def get_loss(self, reduce="sum"):
-        # reduce: 'sum', 'average', None (return list of losses)
-        self.debug("create loss token")
-        cv = self.get_lock("io_tokens")
-        with cv:
-            cv.wait_for(lambda: all([loss is not None for loss in self.losses]))
-            if reduce == "sum":
-                loss = torch.sum(torch.stack(self.losses))
-            elif reduce == "average":
-                loss = torch.mean(torch.stack(self.losses))
-            else:
-                loss = self.losses
-
-            self.debug("return loss")
-            return loss
-
-    def set_output(self, batch_id, output_value):
-        self.outputs[batch_id] = output_value
+            # synchronous handle job
+            self.handle_job(job)
 
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
@@ -188,17 +150,36 @@ class RPCWorker:
             else:
                 mod.eval()
 
-    def fire(self):
-        self.debug(f"activate worker {self.rank} from device {self.device}")
-        self._init_optimizer()
+    def set_input(self, batch_id, args, kwargs):
+        # TODO: check whether we should handle kwargs
+        self.debug(f"set input for batch {batch_id}")
 
-        job_queue = [job for job in self.steps]
+        args = to_device(args, self.device)
 
-        while len(job_queue) > 0:
-            job = job_queue.pop(0)
+        # self.inputs[batch_id] = args
 
-            # synchronous handle job
-            self.handle_job(job)
+        input_node = self.graph.input_node
+        for edge in input_node.out_edges:
+            value = args[edge.idx] if edge.idx is not None else args
+            for end_node in edge.end_nodes:
+                comm_id = self.get_comm_id(0, end_node.idx, edge.idx, batch_id)
+                self.fw_inputs[comm_id] = value
+
+    def set_target(self, batch_id, target):
+        self.targets[batch_id] = target
+
+    def get_loss(self, reduce="sum"):
+        # reduce: 'sum', 'average', None (return list of losses)
+
+        if reduce == "sum":
+            loss = torch.sum(torch.stack(self.losses))
+        elif reduce == "average":
+            loss = torch.mean(torch.stack(self.losses))
+        else:
+            loss = self.losses
+
+        self.debug("return loss")
+        return loss
 
     def handle_job(self, job: Step):
         self.debug(f"start {job}")
@@ -222,22 +203,120 @@ class RPCWorker:
     def get_comm_id(self, start_id: int, end_id: int, edge_id: int, batch_id: int):
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
 
-    def push_fw_act(self, key: str, value):
-        self.debug(f"received forward activation: {key}")
-        cv = self.get_lock("fb_comm")
-        with cv:
-            self.fw_inputs[key] = value
-            cv.notify_all()
+    def _send_preproc(self, value):
+        tensor_list = []
 
-    def push_bw_grad(self, key: str, value):
-        self.debug(f"received backward gradient: {key}")
-        cv = self.get_lock("fb_comm")
-        with cv:
-            self.bw_grads[key] = value
-            cv.notify_all()
+        # map tensor to size
+        def to_size(v):
+            nonlocal tensor_list
+            if torch.is_tensor(v):
+                tensor_list.append(v)
+                return WorkerSize(v.size())
+            else:
+                return v
+
+        value_size = tree_map(to_size, value)
+
+        return tensor_list, value_size
+
+    def send_fw(self, rank: int, key: str, value):
+        tensor_list, value_size = self._send_preproc(value)
+
+        # prepare buffer tensor and irecv
+        base_tag = self.tag_max
+        send_ref = self.workers[rank - 1]
+        send_ref.rpc_async().recv_fw_probe(self.rank, base_tag, key, value_size)
+
+        # async send
+        for i, t in enumerate(tensor_list):
+            dist.isend(t, rank, tag=base_tag + i)
+        self.tag_max += len(tensor_list)
+
+    def send_bw(self, rank: int, key: str, value):
+        tensor_list, value_size = self._send_preproc(value)
+
+        # prepare buffer tensor and irecv
+        base_tag = self.tag_max
+        send_ref = self.workers[rank - 1]
+        send_ref.rpc_async().recv_bw_probe(self.rank, base_tag, key, value_size)
+
+        # async send
+        for i, t in enumerate(tensor_list):
+            dist.isend(t, rank, tag=base_tag + i)
+        self.tag_max += len(tensor_list)
+
+    def _recv_probe(self, rank: int, base_tag: int, key: str, value):
+        if key not in self.buffers:
+            self.buffers[key] = []
+
+        buffer = self.buffers[key]
+        tensor_idx = 0
+
+        def to_future(v):
+            nonlocal tensor_idx, buffer
+            if isinstance(v, WorkerSize):
+                if len(buffer) <= tensor_idx:
+                    buffer.append(
+                        torch.empty(v.size, device=self.device, requires_grad=True)
+                    )
+                elif buffer[tensor_idx].size() != v.size:
+                    buffer[tensor_idx] = torch.empty(
+                        v.size, device=self.device, requires_grad=True
+                    )
+                else:
+                    buffer[tensor_idx].grad = None
+
+                buf = buffer[tensor_idx]
+                fut = WorkerFuture(
+                    dist.irecv(buf, rank, tag=base_tag + tensor_idx), buf
+                )
+                tensor_idx += 1
+                return fut
+            else:
+                return v
+
+        fut_value = tree_map(to_future, value)
+
+        return fut_value
+
+    def recv_fw_probe(self, rank: int, base_tag: int, key: str, value):
+        fut = self._recv_probe(rank, base_tag, f"{key}fw", value)
+        self.fw_inputs[key] = fut
+
+    def recv_bw_probe(self, rank: int, base_tag: int, key: str, value):
+        fut = self._recv_probe(rank, base_tag, f"{key}bw", value)
+        self.bw_grads[key] = fut
+
+    def _wait_value(self, future_dict, key: str):
+        # TODO: busy wait?
+        while key not in future_dict:
+            pass
+
+        futures = []
+
+        def get_future(v):
+            nonlocal futures
+            if isinstance(v, WorkerFuture):
+                futures.append(v)
+                return v.buf
+            return v
+
+        value = tree_map(get_future, future_dict[key])
+
+        for f in futures:
+            f.wait()
+
+        future_dict[key] = value
+
+        return value
+
+    def wait_fw(self, key: str):
+        self._wait_value(self.fw_inputs, key)
+
+    def wait_bw(self, key: str):
+        self._wait_value(self.bw_grads, key)
 
     def send_act(self, node: PipeNode, batch_id: int):
-        cv = self.get_lock("fb_comm")
         curr_rank = node.rank
         curr_id = node.idx
 
@@ -264,31 +343,25 @@ class RPCWorker:
 
             value = tree_map(detach, value)
 
-        with cv:
-            for edge in node.out_edges:
-                for end_node in edge.end_nodes:
-                    comm_id = self.get_comm_id(
-                        curr_id, end_node.idx, edge.idx, batch_id
-                    )
+        for edge in node.out_edges:
+            for end_node in edge.end_nodes:
+                comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
 
-                    self.debug(
-                        f"<SEND_ACT> send to id {comm_id} (node: {end_node.idx} / rank: {end_node.rank})"
-                    )
+                self.debug(
+                    f"<SEND_ACT> send to id {comm_id} (node: {end_node.idx} / rank: {end_node.rank})"
+                )
 
-                    if edge.idx is not None:
-                        value_send = value[edge.idx]
-                    else:
-                        value_send = value
+                if edge.idx is not None:
+                    value_send = value[edge.idx]
+                else:
+                    value_send = value
 
-                    if end_node.rank == curr_rank:
-                        self.fw_inputs[comm_id] = value_send
-                    else:
-                        send_ref = self.workers[end_node.rank - 1]
-                        send_ref.rpc_async().push_fw_act(comm_id, value_send)
-            cv.notify_all()
+                if end_node.rank == curr_rank:
+                    self.fw_inputs[comm_id] = value_send
+                else:
+                    self.send_fw(end_node.rank, comm_id, value_send)
 
     def recv_act(self, node: PipeNode, batch_id: int):
-        cv = self.get_lock("fb_comm")
         curr_id = node.idx
 
         input_keys = []
@@ -296,44 +369,26 @@ class RPCWorker:
             comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             input_keys.append(comm_id)
 
-        if self.logger.isEnabledFor(logging.DEBUG):
-            for comm_id in input_keys:
-                self.debug(
-                    f"<RECV_ACT> requires '{comm_id}' : {'found' if comm_id in self.fw_inputs else 'not found, wait for input'}"
-                )
-
-        def checker():
-            for key in input_keys:
-                if key not in self.fw_inputs:
-                    return False
-            return True
-
-        with cv:
-            cv.wait_for(checker)
+        for key in input_keys:
+            self.wait_fw(key)
 
     def send_grad(self, node: PipeNode, batch_id: int):
-        cv = self.get_lock("fb_comm")
         curr_rank = node.rank
         curr_id = node.idx
 
-        with cv:
-            for edge in node.in_edges:
-                start_node = edge.start_node
-                comm_id = self.get_comm_id(start_node.idx, curr_id, edge.idx, batch_id)
+        for edge in node.in_edges:
+            start_node = edge.start_node
+            comm_id = self.get_comm_id(start_node.idx, curr_id, edge.idx, batch_id)
 
-                value = self.fw_inputs[comm_id]
-                value = tree_map(lambda v: (v.grad if torch.is_tensor(v) else v), value)
+            value = self.fw_inputs[comm_id]
+            value = tree_map(lambda v: (v.grad if torch.is_tensor(v) else v), value)
 
-                if start_node.rank == curr_rank:
-                    self.bw_grads[comm_id] = value
-                else:
-                    send_ref = self.workers[start_node.rank - 1]
-                    send_ref.rpc_async().push_bw_grad(comm_id, value)
-
-            cv.notify_all()
+            if start_node.rank == curr_rank:
+                self.bw_grads[comm_id] = value
+            else:
+                self.send_bw(start_node.rank, comm_id, value)
 
     def recv_grad(self, node: PipeNode, batch_id: int):
-        cv = self.get_lock("fb_comm")
         curr_id = node.idx
 
         grad_keys = []
@@ -344,20 +399,8 @@ class RPCWorker:
                 comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
                 grad_keys.append(comm_id)
 
-        if self.logger.isEnabledFor(logging.DEBUG):
-            for comm_id in grad_keys:
-                self.debug(
-                    f"<RECV_GRAD> requires '{comm_id}' : {'found' if comm_id in self.bw_grads else 'not found, wait for input'}"
-                )
-
-        def checker():
-            for key in grad_keys:
-                if key not in self.bw_grads:
-                    return False
-            return True
-
-        with cv:
-            cv.wait_for(checker)
+        for key in grad_keys:
+            self.wait_bw(key)
 
     def optimizer_step(self, node: PipeNode, batch_id: int):
         self.optimizer.step()
@@ -393,21 +436,12 @@ class RPCWorker:
         is_end_node = is_end_node and self.loss_fn is not None
 
         if is_end_node:
-            io_cv = self.get_lock("io_data")
-            with io_cv:
-                io_cv.wait_for(lambda: self.targets[batch_id] is not None)
-                result = self.loss_fn(result, self.targets[batch_id])
-                self.losses[batch_id] = result
+            result = self.loss_fn(result, self.targets[batch_id])
+            self.losses[batch_id] = result
 
         self.fw_results[batch_id] = result
 
         torch.cuda.current_stream(self.device).synchronize()
-
-        if is_end_node:
-            token_cv = self.get_lock("io_tokens")
-            with token_cv:
-                self.io_tokens[batch_id] = True
-                token_cv.notify_all()
 
     def backward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
@@ -432,10 +466,3 @@ class RPCWorker:
 
         torch.autograd.backward(self.fw_results[batch_id], grads)
         torch.cuda.current_stream(self.device).synchronize()
-
-        # is first node
-        if node.idx == 1:
-            token_cv = self.get_lock("io_tokens")
-            with token_cv:
-                self.io_tokens[batch_id] = True
-                token_cv.notify_all()
