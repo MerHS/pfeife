@@ -3,6 +3,7 @@ import time
 import threading
 
 import torch
+import torch.distributed as dist
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
@@ -10,8 +11,9 @@ SIZE = 5000
 
 
 class MyModule:
-    def __init__(self, device, next_rpc):
+    def __init__(self, rank, device, next_rpc):
         super().__init__()
+        self.rank = rank
         self.device = device
         self.w1 = torch.rand(SIZE, SIZE, device=device, requires_grad=False)
         self.w2 = torch.rand(SIZE, SIZE, device=device, requires_grad=False)
@@ -21,7 +23,13 @@ class MyModule:
         self.end_time = 0
         self.count = 0
 
-    def matmul(self, x, base_time):
+        self.input = torch.empty(SIZE, SIZE, device=device, requires_grad=False)
+
+    def matmul(self, base_time):
+        rv = dist.irecv(self.input, self.rank - 1)
+        rv.wait()
+        x = self.input
+
         start_time = time.time()
 
         w1 = self.w1
@@ -36,9 +44,10 @@ class MyModule:
         end_time = time.time()
 
         if self.next is not None:
-            send = self.next.rpc_async().matmul(y, end_time)
-            send.wait()
-            self.wait_time += time.time() - start_time
+            mm = self.next.rpc_async().matmul(end_time)
+            dist.isend(y, self.rank + 1)
+            self.wait_time += time.time() - end_time
+            mm.wait()
 
         self.start_time += start_time - base_time
         self.end_time += end_time - start_time
@@ -72,10 +81,9 @@ def calc(x, w1, w2):
 
 def run_main(base_time):
     print(f"Repeat 20 times, matmul -> send {SIZE}x{SIZE}")
-    m3 = rpc.remote("worker3", MyModule, args=("cuda:3", None))
-    m2 = rpc.remote("worker2", MyModule, args=("cuda:2", m3))
-    m1 = rpc.remote("worker1", MyModule, args=("cuda:1", m2))
-    m0 = rpc.remote("worker0", MyModule, args=("cuda:0", m1))
+    m3 = rpc.remote("worker3", MyModule, args=(3, "cuda:3", None))
+    m2 = rpc.remote("worker2", MyModule, args=(2, "cuda:2", m3))
+    m1 = rpc.remote("worker1", MyModule, args=(1, "cuda:1", m2))
 
     x = torch.rand(SIZE, SIZE, device="cuda:0", requires_grad=False)
     torch.cuda.current_stream("cuda:0").synchronize()
@@ -85,11 +93,10 @@ def run_main(base_time):
     print("warmup")
     for _ in range(5):
         start_time = time.time()
-        wait = m0.rpc_async().matmul(x, start_time)
-
+        wait = m1.rpc_async().matmul(start_time)
+        dist.isend(x, 1)
         wait.wait()
 
-    m0.rpc_sync().reset_time()
     m1.rpc_sync().reset_time()
     m2.rpc_sync().reset_time()
     m3.rpc_sync().reset_time()
@@ -99,34 +106,36 @@ def run_main(base_time):
     base_start = time.time()
     for _ in range(20):
         start_time = time.time()
-        wait = m0.rpc_async().matmul(x, start_time)
-
+        wait = m1.rpc_async().matmul(start_time)
+        dist.isend(x, 1)
         wait.wait()
+
     base_end = time.time()
 
-    (s0, e0, w0) = m0.rpc_sync().get_time()
     (s1, e1, w1) = m1.rpc_sync().get_time()
     (s2, e2, w2) = m2.rpc_sync().get_time()
     (s3, e3, w3) = m3.rpc_sync().get_time()
 
     print("\n+++ Latency +++")
     print(f"[Master] 20 times Total: {base_end - base_start:8.5f}")
-    print(f"[Worker 0] Receive latency (0->0): {s0:8.5f}, matmul latency: {e0:8.5f}")
-    print(f"[Worker 1] Receive latency (0->1): {s1:8.5f}, matmul latency: {e1:8.5f}")
-    print(f"[Worker 2] Receive latency (1->2): {s2:8.5f}, matmul latency: {e2:8.5f}")
-    print(f"[Worker 3] Receive latency (2->3): {s3:8.5f}, matmul latency: {e3:8.5f}")
+    print(
+        f"[Worker 1] Receive latency (nccl 0->1): {s1:8.5f}, matmul latency: {e1:8.5f}, isend: {w1:8.5f}"
+    )
+    print(
+        f"[Worker 2] Receive latency (nccl 1->2): {s2:8.5f}, matmul latency: {e2:8.5f}, isend: {w2:8.5f}"
+    )
+    print(
+        f"[Worker 3] Receive latency (nccl 2->3): {s3:8.5f}, matmul latency: {e3:8.5f}"
+    )
 
-    (w0, w00, y0) = m0.rpc_sync().get_weights()
     (w1, w11, y1) = m1.rpc_sync().get_weights()
     (w2, w22, y2) = m2.rpc_sync().get_weights()
     (w3, w33, y3) = m3.rpc_sync().get_weights()
 
     print("\n+++ Validity +++")
-    y00 = calc(x, w0, w00)
-    y11 = calc(y00, w1, w11)
+    y11 = calc(x, w1, w11)
     y22 = calc(y11, w2, w22)
     y33 = calc(y22, w3, w33)
-    print(f"[{(y0 == y00).all()}] y0 remote: {y0[0][0:5]}, local: {y00[0][0:5]}")
     print(f"[{(y1 == y11).all()}] y1 remote: {y1[0][0:5]}, local: {y11[0][0:5]}")
     print(f"[{(y2 == y22).all()}] y2 remote: {y2[0][0:5]}, local: {y22[0][0:5]}")
     print(f"[{(y3 == y33).all()}] y3 remote: {y3[0][0:5]}, local: {y33[0][0:5]}")
@@ -136,11 +145,10 @@ def run_worker(rank, base_time):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    curr_device = "cuda:0" if rank == 0 else f"cuda:{rank - 1}"
-    proc_name = "master" if rank == 0 else f"worker{rank - 1}"
+    curr_device = f"cuda:{rank}"
+    proc_name = f"worker{rank}"
 
     device_map = {
-        "master": {curr_device: "cuda:0"},
         "worker0": {curr_device: "cuda:0"},
         "worker1": {curr_device: "cuda:1"},
         "worker2": {curr_device: "cuda:2"},
@@ -151,7 +159,8 @@ def run_worker(rank, base_time):
         num_worker_threads=128, device_maps=device_map
     )
 
-    rpc.init_rpc(proc_name, rank=rank, world_size=5, rpc_backend_options=options)
+    dist.init_process_group("nccl", world_size=4, rank=rank)
+    rpc.init_rpc(proc_name, rank=rank, world_size=4, rpc_backend_options=options)
 
     if rank == 0:
         run_main(base_time)
@@ -162,4 +171,4 @@ def run_worker(rank, base_time):
 
 if __name__ == "__main__":
     base_time = time.time()
-    mp.spawn(run_worker, nprocs=5, join=True, args=(base_time,))
+    mp.spawn(run_worker, nprocs=4, join=True, args=(base_time,))
