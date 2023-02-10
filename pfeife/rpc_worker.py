@@ -124,7 +124,7 @@ class RPCWorker:
         io_cv = self.get_lock("io_data")
         with io_cv:
             self.inputs[batch_id] = args
-            io_cv.notify()
+            io_cv.notify_all()
 
         comm_cv = self.get_lock("fb_comm")
         input_node = self.graph.input_node
@@ -135,13 +135,13 @@ class RPCWorker:
                     comm_id = self.get_comm_id(0, end_node.idx, edge.idx, batch_id)
                     self.debug(f"input id for batch {batch_id}: {comm_id}")
                     self.fw_inputs[comm_id] = value
-            comm_cv.notify()
+            comm_cv.notify_all()
 
     def set_target(self, batch_id, target):
         cv = self.get_lock("io_data")
         with cv:
             self.targets[batch_id] = target
-            cv.notify()
+            cv.notify_all()
 
     def get_io_token(self, batch_id):
         self.debug(f"create IO token for {batch_id}")
@@ -237,14 +237,14 @@ class RPCWorker:
         cv = self.get_lock("fb_comm")
         with cv:
             self.fw_inputs[key] = value
-            cv.notify()
+            cv.notify_all()
 
     def push_bw_grad(self, key: str, value):
         self.debug(f"received backward gradient: {key}")
         cv = self.get_lock("fb_comm")
         with cv:
             self.bw_grads[key] = value
-            cv.notify()
+            cv.notify_all()
 
     def send_act(self, node: PipeNode, batch_id: int):
         cv = self.get_lock("fb_comm")
@@ -295,7 +295,7 @@ class RPCWorker:
                     else:
                         send_ref = self.workers[end_node.rank - 1]
                         send_ref.rpc_async().push_fw_act(comm_id, value_send)
-            cv.notify()
+            cv.notify_all()
 
     def recv_act(self, node: PipeNode, batch_id: int):
         cv = self.get_lock("fb_comm")
@@ -340,7 +340,7 @@ class RPCWorker:
                     send_ref = self.workers[start_node.rank - 1]
                     send_ref.rpc_async().push_bw_grad(comm_id, value)
 
-            cv.notify()
+            cv.notify_all()
 
     def recv_grad(self, node: PipeNode, batch_id: int):
         cv = self.get_lock("fb_comm")
@@ -416,7 +416,7 @@ class RPCWorker:
             token_cv = self.get_lock("io_tokens")
             with token_cv:
                 self.io_tokens[batch_id] = True
-                token_cv.notify()
+                token_cv.notify_all()
 
     def backward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
@@ -447,6 +447,4 @@ class RPCWorker:
             token_cv = self.get_lock("io_tokens")
             with token_cv:
                 self.io_tokens[batch_id] = True
-                token_cv.notify()
-                # TODO: why should we notify twice?
-                token_cv.notify()
+                token_cv.notify_all()
