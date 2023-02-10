@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import List, Union
 
 import torch
@@ -17,8 +18,6 @@ from .pipe_graph import PipeGraph
 from .rpc_worker import RPCWorker
 from .scheduler import get_scheduler
 from .utils import get_logger
-
-log = get_logger()
 
 
 def fetch_attr(module, target: str):
@@ -142,10 +141,9 @@ class PipeGraphRunner(nn.Module):
             if self.manager.is_train
             else None
         )
-        backward_token = self.in_worker.rpc_async().get_io_token(batch_no)
 
         return [
-            PipeTensor(batch_no, output_token, backward_token),
+            PipeTensor(batch_no, output_token),
         ]
 
 
@@ -162,6 +160,8 @@ class PipeManager:
         self.batch_no = 0
         self.is_train = True
         self.graph = None
+        self.base_time = time.time()
+        self.logger = get_logger()
 
         self.set_option(option)
         self._compile()
@@ -183,17 +183,27 @@ class PipeManager:
 
         # TODO: check this will remove (GC-out) worker objects
         self.rpc_workers: List[PyRRef] = []
+
+        base_time = self.base_time
         for rank in range(1, self.device_cnt + 1):
             device = f"cuda:{rank-1}"
             worker = rpc.remote(
                 f"worker_{rank}",
                 RPCWorker,
-                args=(rank, device, option),
+                args=(rank, device, option, base_time),
             )
             self.rpc_workers.append(worker)
 
         for worker in self.rpc_workers:
             worker.rpc_sync().set_workers(self.rpc_workers)
+
+    def debug(self, msg):
+        t = time.time()
+        self.logger.debug(f"({t - self.base_time:8.5f})[Master] {msg}")
+
+    def info(self, msg):
+        t = time.time()
+        self.logger.info(f"({t - self.base_time:8.5f})[Master] {msg}")
 
     def _compile(self):
         def compile_fn(gm: fx.GraphModule, example_inputs: List[torch.Tensor]):
@@ -248,10 +258,9 @@ class PipeManager:
 
             split_gm.recompile()
 
-            log.info(
+            self.debug(
                 "\n---final graph---\n" + str(split_gm.graph) + "\n---------------\n"
             )
-            print(split_gm.graph)
 
             runner = PipeGraphRunner(self, split_gm)
 
@@ -289,6 +298,7 @@ class PipeManager:
         2. forward & backward & optimizer step
         3. return loss
         """
+        self.debug("start run")
 
         # TODO: evaluation pass
         self.init_runner()
@@ -307,14 +317,19 @@ class PipeManager:
             out_worker.rpc_sync().set_target(batch_id, target)
 
         # ignite worker (add jobs to job queue)
+        loops = []
         for worker in self.rpc_workers:
-            worker.rpc_async().fire()
+            loop = worker.rpc_async().fire()
+            loops.append(loop)
 
         # run and wait tokens
         for pt in tokens:
             pt.output_token.wait()
             if pt.backward_token is not None:
                 pt.backward_token.wait()
+
+        for loop in loops:
+            loop.wait()
 
         loss = out_worker.rpc_sync().get_loss("sum")
 

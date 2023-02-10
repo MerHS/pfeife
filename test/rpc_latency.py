@@ -6,7 +6,7 @@ import torch
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
-SIZE = 5000
+SIZE = 500
 
 
 class MyModule:
@@ -77,9 +77,9 @@ def run_main(base_time):
     m1 = rpc.remote("worker1", MyModule, args=("cuda:1", m2))
     m0 = rpc.remote("worker0", MyModule, args=("cuda:0", m1))
 
-    x = torch.rand(SIZE, SIZE, device="cuda:0", requires_grad=False)
-    torch.cuda.current_stream("cuda:0").synchronize()
-    torch.cuda.synchronize()
+    x = torch.rand(SIZE, SIZE, device="cpu", requires_grad=False)
+    # torch.cuda.current_stream("cuda:0").synchronize()
+    # torch.cuda.synchronize()
 
     # warmup
     print("warmup")
@@ -111,7 +111,7 @@ def run_main(base_time):
 
     print("\n+++ Latency +++")
     print(f"[Master] 20 times Total: {base_end - base_start:8.5f}")
-    print(f"[Worker 0] Receive latency (0->0): {s0:8.5f}, matmul latency: {e0:8.5f}")
+    print(f"[Worker 0] Receive latency (cpu->0): {s0:8.5f}, matmul latency: {e0:8.5f}")
     print(f"[Worker 1] Receive latency (0->1): {s1:8.5f}, matmul latency: {e1:8.5f}")
     print(f"[Worker 2] Receive latency (1->2): {s2:8.5f}, matmul latency: {e2:8.5f}")
     print(f"[Worker 3] Receive latency (2->3): {s3:8.5f}, matmul latency: {e3:8.5f}")
@@ -122,10 +122,25 @@ def run_main(base_time):
     (w3, w33, y3) = m3.rpc_sync().get_weights()
 
     print("\n+++ Validity +++")
+    x = x.cuda()
+    w0 = w0.cuda()
+    w00 = w00.cuda()
+    w1 = w1.cuda()
+    w11 = w11.cuda()
+    w2 = w2.cuda()
+    w22 = w22.cuda()
+    w3 = w3.cuda()
+    w33 = w33.cuda()
+    y0 = y0.cuda()
+    y1 = y1.cuda()
+    y2 = y2.cuda()
+    y3 = y3.cuda()
+
     y00 = calc(x, w0, w00)
     y11 = calc(y00, w1, w11)
     y22 = calc(y11, w2, w22)
     y33 = calc(y22, w3, w33)
+
     print(f"[{(y0 == y00).all()}] y0 remote: {y0[0][0:5]}, local: {y00[0][0:5]}")
     print(f"[{(y1 == y11).all()}] y1 remote: {y1[0][0:5]}, local: {y11[0][0:5]}")
     print(f"[{(y2 == y22).all()}] y2 remote: {y2[0][0:5]}, local: {y22[0][0:5]}")
@@ -136,11 +151,11 @@ def run_worker(rank, base_time):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    curr_device = "cuda:0" if rank == 0 else f"cuda:{rank - 1}"
+    curr_device = "cpu" if rank == 0 else f"cuda:{rank - 1}"
     proc_name = "master" if rank == 0 else f"worker{rank - 1}"
 
     device_map = {
-        "master": {curr_device: "cuda:0"},
+        "master": {curr_device: "cpu"},
         "worker0": {curr_device: "cuda:0"},
         "worker1": {curr_device: "cuda:1"},
         "worker2": {curr_device: "cuda:2"},

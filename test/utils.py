@@ -34,7 +34,7 @@ def setup_torchbench_cwd():
 
 
 def synchronize():
-    pass
+    torch.cuda.synchronize()
 
 
 def reset_rng_state():

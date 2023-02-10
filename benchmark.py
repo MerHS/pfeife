@@ -59,7 +59,7 @@ def run_model(args, model, inputs, option):
         model = torch.compile(model, backend=option.compiler)
 
         def model_iter_fn(model, example_inputs, collect_outputs=False):
-            inputs = [x.cuda() for x in example_inputs]
+            inputs = [x.detach().cuda() for x in example_inputs]
             outputs = model(*inputs)
             loss = outputs.sum()
             loss.backward()
@@ -131,7 +131,7 @@ if __name__ == "__main__":
     parser.add_argument("--device_cnt", type=int, default=2)
     parser.add_argument("--pipe_split", type=int, default=2)
     parser.add_argument("--batch_split", type=int, default=4)
-    parser.add_argument("--repeat", default=5, type=int, help="Repeats for timing run")
+    parser.add_argument("--repeat", default=10, type=int, help="Repeats for timing run")
     parser.add_argument(
         "--model",
         default="timm_vision_transformer",

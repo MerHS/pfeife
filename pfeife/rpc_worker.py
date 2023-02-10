@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from typing import Dict, List
 
 import torch
@@ -16,9 +17,10 @@ from .utils import get_logger, to_device
 
 
 class RPCWorker:
-    def __init__(self, rank: int, device: str, option: PipeOption):
+    def __init__(self, rank: int, device: str, option: PipeOption, base_time=0):
         self.logger = get_logger()
 
+        self.base_time = base_time
         self.option = option
         self.rank = rank
         self.device = device
@@ -35,8 +37,6 @@ class RPCWorker:
 
         self.locks: Dict[str, threading.Condition] = dict()
 
-        # handle job queue
-        self.add_lock("job_queue")
         # handle io tokens for the master node
         self.add_lock("io_tokens")
         # handle io data for the master node
@@ -50,11 +50,6 @@ class RPCWorker:
         )
 
         self.reset_cache()
-
-        self.run_loop = threading.Thread(
-            target=self.runner, name=f"worker_runner_{rank}", daemon=True
-        )
-        self.run_loop.start()
 
     def _init_optimizer(self):
         if self.optimizer is None:
@@ -73,10 +68,12 @@ class RPCWorker:
         return (self.params[0], self.params[0].grad)
 
     def debug(self, msg):
-        self.logger.debug(f"[Worker {self.rank}] {msg}")
+        t = time.time()
+        self.logger.debug(f"({t - self.base_time:8.5f})[Worker {self.rank}] {msg}")
 
     def info(self, msg):
-        self.logger.info(f"[Worker {self.rank}] {msg}")
+        t = time.time()
+        self.logger.info(f"({t - self.base_time:8.5f})[Worker {self.rank}] {msg}")
 
     def reset_cache(self):
         self.inputs = [None for _ in range(self.option.batch_cnt)]
@@ -89,7 +86,6 @@ class RPCWorker:
         self.bw_grads = dict()
 
         self.io_tokens = [None for _ in range(self.option.batch_cnt)]
-        self.job_queue: List[Step] = []
         self.current_job: Step = None
 
     def add_lock(self, name):
@@ -195,17 +191,11 @@ class RPCWorker:
     def fire(self):
         self.debug(f"activate worker {self.rank} from device {self.device}")
         self._init_optimizer()
-        cv = self.get_lock("job_queue")
-        with cv:
-            self.job_queue = [job for job in self.steps]
-            cv.notify()
 
-    def runner(self):
-        cv = self.get_lock("job_queue")
-        while True:
-            with cv:
-                cv.wait_for(lambda: len(self.job_queue) > 0)
-                job = self.job_queue.pop(0)
+        job_queue = [job for job in self.steps]
+
+        while len(job_queue) > 0:
+            job = job_queue.pop(0)
 
             # synchronous handle job
             self.handle_job(job)
@@ -372,6 +362,7 @@ class RPCWorker:
     def optimizer_step(self, node: PipeNode, batch_id: int):
         self.optimizer.step()
         torch.cuda.current_stream(self.device).synchronize()
+        self.debug("optimizer end")
 
     def forward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
