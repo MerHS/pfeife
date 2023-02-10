@@ -1,11 +1,13 @@
 import argparse
 import logging
 import os
+import random
 from datetime import datetime
-from test.utils import get_model, timed
 
+import numpy as np
 import torch
 import torch._dynamo as dynamo
+import torch.backends.cudnn as cudnn
 from torch.profiler import ProfilerActivity, profile
 
 from pfeife import PipeManager, run_master
@@ -14,12 +16,24 @@ from pfeife.utils import get_logger
 from pfeife.option import PipeOption
 from pfeife.compile import compile_module
 
+from test.utils import get_model, timed
+
 log = get_logger()
 
 now = datetime.now()
 current_time = now.strftime("%y%m%d-%H%M%S")
 dir_path = os.path.dirname(os.path.realpath(__file__))
 result_path = f"{dir_path}/result/pipe-test-{current_time}"
+
+
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+    random.seed(seed)
 
 
 def profile_model(model_iter_fn, model, inputs):
@@ -87,9 +101,13 @@ def run_valid(args, model, inputs, option):
 
     model.train()
 
+    set_seed()
+
     pipe = PipeManager(model, loss_fn=SumLoss(), option=option)
     target = torch.rand(args.batch_size, 10)
     pipe_outputs = pipe.run(target, *inputs)
+
+    set_seed()
 
     optim = torch.optim.Adam(model.parameters(), **option.optimizer_kwargs)
     optim.zero_grad()
@@ -109,7 +127,10 @@ def run_valid(args, model, inputs, option):
     print(f"pipe param[0] grad: {pipe_grad.reshape(-1)[:5]}")
     print(f"cpu param[0] grad: {cpu_param.grad.reshape(-1)[:5]}")
 
+    set_seed()
     pipe_outputs2 = pipe.run(target, *inputs)
+
+    set_seed()
     cpu_outputs2 = model(*inputs).sum()
     print(f"second pipe output (sum): {pipe_outputs2}")
     print(f"second cpu output (sum): {cpu_outputs2}")
