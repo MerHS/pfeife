@@ -20,18 +20,13 @@ class Logger:
         print(f"[{name}]({t - self.st:5.3f}) {text}")
 
 
-def run_worker(rank, use_nccl):
+def run_worker(rank):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "29500"
 
-    if use_nccl:
-        dist.init_process_group("nccl", world_size=2, rank=rank)
-        dev0 = "cuda:0"
-        dev1 = "cuda:1"
-    else:
-        dist.init_process_group("gloo", world_size=2, rank=rank)
-        dev0 = "cpu"
-        dev1 = "cpu"
+    dist.init_process_group("mpi")
+    dev0 = "cpu"
+    dev1 = "cpu"
 
     logger = Logger(rank)
 
@@ -62,10 +57,10 @@ def run_worker(rank, use_nccl):
         buf2 = torch.rand(SIZE * 2, SIZE * 2, device=dev1)
 
         logger.log("irecv 1")
-        f1 = dist.irecv(buf1, 0, tag=1).get_future()
+        f1 = dist.irecv(buf1, 0, tag=1)
 
         logger.log("irecv 2")
-        f2 = dist.irecv(buf2, 0, tag=2).get_future()
+        f2 = dist.irecv(buf2, 0, tag=2)
 
         logger.log("waiting...")
 
@@ -77,10 +72,5 @@ def run_worker(rank, use_nccl):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument("--nccl", action="store_true")
-    args = parser.parse_args()
-
-    print(f"Use NCCL: {args.nccl}")
-
-    mp.spawn(run_worker, nprocs=2, join=True, args=(args.nccl,))
+    rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+    run_worker(rank)
