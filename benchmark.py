@@ -10,7 +10,8 @@ import torch._dynamo as dynamo
 import torch.backends.cudnn as cudnn
 from torch.profiler import ProfilerActivity, profile
 
-from pfeife import PipeManager, run_master
+from pfeife.local import PipeManager as LocalManager
+from pfeife.rpc import PipeManager as RPCManager, run_master
 from pfeife.loss import SumLoss
 from pfeife.utils import get_logger
 from pfeife.option import PipeOption
@@ -51,49 +52,6 @@ def profile_model(model_iter_fn, model, inputs):
         for i in range(5):
             model_iter_fn(model, inputs)
             prof.step()
-
-
-def run_model(args, model, inputs, option):
-    dynamo.reset()
-
-    if not args.no_pipe:
-        model = PipeManager(model, loss_fn=SumLoss(), option=option)
-
-        def model_iter_fn(model, example_inputs, collect_outputs=False):
-            target = torch.rand(args.batch_size, 10)
-            outputs = model.run(target, *example_inputs)
-
-            if collect_outputs:
-                return outputs
-
-    else:
-        model = model.cuda()
-
-        optim = torch.optim.Adam(model.parameters())
-        model = torch.compile(model, backend=option.compiler)
-
-        def model_iter_fn(model, example_inputs, collect_outputs=False):
-            inputs = [x.detach().cuda() for x in example_inputs]
-            outputs = model(*inputs)
-            loss = outputs.sum()
-            loss.backward()
-            optim.zero_grad()
-            optim.step()
-            if collect_outputs:
-                return outputs
-
-    model.train()
-
-    # warmup
-    if args.profile:
-        profile_model(model_iter_fn, model, inputs)
-    else:
-        _ = timed(model, model_iter_fn, inputs, times=3, return_result=False)
-        t_total = timed(
-            model, model_iter_fn, inputs, times=args.repeat, return_result=False
-        )
-
-        print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
 
 
 def run_valid(args, model, inputs, option):
@@ -138,6 +96,52 @@ def run_valid(args, model, inputs, option):
     print(f"second vanilla output (sum): {cpu_outputs2}")
 
 
+def run_model(args, model, inputs, option):
+    dynamo.reset()
+
+    if not args.no_pipe:
+        if args.single_proc:
+            model = LocalManager(model, loss_fn=SumLoss(), option=option)
+        else:
+            model = RPCManager(model, loss_fn=SumLoss(), option=option)
+
+        def model_iter_fn(model, example_inputs, collect_outputs=False):
+            target = torch.rand(args.batch_size, 10)
+            outputs = model.run(target, *example_inputs)
+
+            if collect_outputs:
+                return outputs
+
+    else:
+        model = model.cuda()
+
+        optim = torch.optim.Adam(model.parameters())
+        model = torch.compile(model, backend=option.compiler)
+
+        def model_iter_fn(model, example_inputs, collect_outputs=False):
+            inputs = [x.detach().cuda() for x in example_inputs]
+            outputs = model(*inputs)
+            loss = outputs.sum()
+            loss.backward()
+            optim.zero_grad()
+            optim.step()
+            if collect_outputs:
+                return outputs
+
+    model.train()
+
+    # warmup
+    if args.profile:
+        profile_model(model_iter_fn, model, inputs)
+    else:
+        _ = timed(model, model_iter_fn, inputs, times=3, return_result=False)
+        t_total = timed(
+            model, model_iter_fn, inputs, times=args.repeat, return_result=False
+        )
+
+        print(f"mean latency {t_total / args.repeat} across {args.repeat} runs")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -146,6 +150,7 @@ if __name__ == "__main__":
         help="if set to a str, uses dynamo[str] backend. else, aot_eager",
     )
     parser.add_argument("--no_pipe", action="store_true")
+    parser.add_argument("--single_proc", action="store_true")
     parser.add_argument("--scheduler", default="gpipe")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -186,7 +191,7 @@ if __name__ == "__main__":
 
     if args.check_valid:
         run_master(run_valid, args=(args, model, inputs, option), option=option)
-    elif args.no_pipe:
+    elif args.no_pipe or args.single_proc:
         run_model(args, model, inputs, option)
     else:
         run_master(run_model, args=(args, model, inputs, option), option=option)

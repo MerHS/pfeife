@@ -4,8 +4,8 @@ import torch.distributed as dist
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 
-from .option import PipeOption
-from .utils import set_logger_level
+from ..option import PipeOption
+from ..utils import set_logger_level
 
 
 def get_rpc_name(rank):

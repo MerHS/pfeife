@@ -50,33 +50,6 @@ class Scheduler:
         # returns node clusters and steps
         raise NotImplementedError()
 
-    def assign_train_steps_to_workers(
-        self, workers: List[PyRRef], modules: List[torch.nn.Module]
-    ):
-        rank_clusters = self.cluster
-
-        devices = []
-        for worker_id, cluster in enumerate(rank_clusters):
-            worker = workers[worker_id]
-            worker_device = worker.rpc_sync().get_device()
-            devices.append(worker_device)
-
-            for node_id in cluster:
-                node = self.graph.internal_nodes[node_id]
-                node.device = worker_device
-
-        input_node = self.graph.input_node
-        input_node.device = devices[input_node.rank - 1]
-        output_node = self.graph.output_node
-        output_node.device = devices[output_node.rank - 1]
-
-        for worker_id, (worker, cluster) in enumerate(zip(workers, rank_clusters)):
-            worker.rpc_sync().set_graph(self.graph)
-            worker.rpc_sync().set_scheduler_steps(self.get_train_steps(worker_id))
-            for mod_id in cluster:
-                module = modules[mod_id]
-                worker.rpc_sync().set_module(mod_id, module)
-
     def get_train_steps(self, worker_id: int) -> List[Step]:
         if worker_id >= len(self.sched):
             return []

@@ -10,82 +10,14 @@ import torch.nn as nn
 from torch.nn.modules.loss import _Loss
 from torch.distributed.rpc import PyRRef
 
-from .batch import split_args_kwargs
-from .graph_split import ParamSplit
-from .loss import LossWrapper
-from .option import PipeOption
-from .pipe_graph import PipeGraph
 from .rpc_worker import RPCWorker
-from .scheduler import get_scheduler
-from .utils import get_logger
-
-
-def fetch_attr(module, target: str):
-    target_atoms = target.split(".")
-    attr_itr = module
-    for i, atom in enumerate(target_atoms):
-        if not hasattr(attr_itr, atom):
-            raise RuntimeError(
-                f"Node referenced nonexistent target {'.'.join(target_atoms[:i])}"
-            )
-        attr_itr = getattr(attr_itr, atom)
-    return attr_itr
-
-
-def get_submodules(gm: fx.GraphModule):
-    mods = []
-    for node in gm.graph.nodes:
-        if node.op == "call_module":
-            mods.append(fetch_attr(gm, node.target))
-    return mods
-
-
-def move_param_to_callee(
-    root, node, callee_name, param_val, qualname_map, use_idx, is_buffer
-):
-    assert isinstance(
-        param_val, torch.Tensor
-    ), f"Expected '{node.target}' to be {torch.Tensor} but got {type(param_val)}." + (
-        f" It might happen if module '{node.target}' was passed to some 'leaf function'"
-        f"(see https://pytorch.org/docs/stable/fx.html#pippy.fx.wrap). Please inspect "
-        f"usages of '{node.target}' in the traced graph."
-        if isinstance(param_val, torch.nn.Module)
-        else ""
-    )
-    callee = root.get_submodule(callee_name)
-    new_param_name = f"moved_{node.target.replace('.', '_')}"
-    assert not hasattr(
-        callee, new_param_name
-    ), f"Module {callee_name} already has a parameter named {new_param_name}"
-    if is_buffer:
-        callee.register_buffer(new_param_name, param_val)
-    else:
-        setattr(callee, new_param_name, param_val)
-
-    # Update qualname mapping
-    # New qualname will have submodule prefix
-    new_qualname = f"{callee_name}.{new_param_name}"
-    if node.target in qualname_map:
-        # Just in case the target name is already in the qualname_map
-        # returned by split_module() -- we update the mapping using the
-        # new name as a new key
-        qualname_map[new_qualname] = qualname_map.pop(node.target)
-    else:
-        qualname_map[new_qualname] = node.target
-
-    ph_counter = 0
-    for sn in callee.graph.nodes:
-        if sn.op == "placeholder":
-            if ph_counter == use_idx:
-                with callee.graph.inserting_before(sn):
-                    get_attr = callee.graph.get_attr(new_param_name)
-                    sn.replace_all_uses_with(get_attr)
-                    callee.graph.erase_node(sn)
-            ph_counter += 1
-    callee.graph.lint()
-    callee.recompile()
-
-    return get_attr
+from ..batch import split_args_kwargs
+from ..graph_split import ParamSplit
+from ..loss import LossWrapper
+from ..option import PipeOption
+from ..pipe_graph import PipeGraph
+from ..scheduler import get_scheduler
+from ..utils import get_logger, fetch_attr, get_submodules, move_param_to_callee
 
 
 # TODO: make it a real tensor
@@ -119,7 +51,7 @@ class PipeGraphRunner(nn.Module):
 
         mods = get_submodules(gm)
         mods = [mod.to("cpu") for mod in mods]
-        self.sched.assign_train_steps_to_workers(manager.rpc_workers, mods)
+        self.assign_train_steps_to_workers(manager.rpc_workers, mods)
 
         input_rank = self.graph.input_node.rank
         output_rank = self.graph.output_node.rank
@@ -127,6 +59,35 @@ class PipeGraphRunner(nn.Module):
         self.out_worker = self.workers[output_rank - 1]
 
         self.out_worker.rpc_sync().set_loss_fn(manager.loss_fn)
+
+    def assign_train_steps_to_workers(
+        self, workers: List[PyRRef], modules: List[torch.nn.Module]
+    ):
+        sched = self.sched
+        graph = self.graph
+        rank_clusters = sched.cluster
+
+        devices = []
+        for worker_id, cluster in enumerate(rank_clusters):
+            worker = workers[worker_id]
+            worker_device = worker.rpc_sync().get_device()
+            devices.append(worker_device)
+
+            for node_id in cluster:
+                node = graph.internal_nodes[node_id]
+                node.device = worker_device
+
+        input_node = graph.input_node
+        input_node.device = devices[input_node.rank - 1]
+        output_node = graph.output_node
+        output_node.device = devices[output_node.rank - 1]
+
+        for worker_id, (worker, cluster) in enumerate(zip(workers, rank_clusters)):
+            worker.rpc_sync().set_graph(graph)
+            worker.rpc_sync().set_scheduler_steps(sched.get_train_steps(worker_id))
+            for mod_id in cluster:
+                module = modules[mod_id]
+                worker.rpc_sync().set_module(mod_id, module)
 
     def forward(self, *args, **kwargs):
         # TODO: fire workers from here if there is multiple runners
