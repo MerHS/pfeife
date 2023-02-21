@@ -7,8 +7,7 @@ from queue import Queue
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.distributed as dist
-from torch.distributed.rpc import PyRRef
+from torch.futures import Future
 from torch.utils._pytree import tree_map
 
 from ..compile import compile_module
@@ -43,8 +42,8 @@ class ThreadWorker:
             optim.Adam if option.optimizer_type == "adam" else optim.SGD
         )
 
-        self.fw_lock = threading.Lock()
-        self.bw_lock = threading.Lock()
+        self.fw_queue = Queue()
+        self.bw_queue = Queue()
 
         self.reset_cache()
 
@@ -80,7 +79,7 @@ class ThreadWorker:
     def clear_workers(self):
         self.workers = []
 
-    def set_workers(self, workers: List[PyRRef]):
+    def set_workers(self, workers: List["ThreadWorker"]):
         self.workers = workers
 
     def set_graph(self, pipe_graph: PipeGraph):
@@ -149,12 +148,12 @@ class ThreadWorker:
         self.debug(f"activate worker {self.rank} from device {self.device}")
         self._init_optimizer()
 
-        job_queue = [job for job in self.steps]
+        self.thread = threading.Thread(target=self.run_thread, daemon=True)
+        self.thread.start()
+        return self.thread
 
-        while len(job_queue) > 0:
-            job = job_queue.pop(0)
-
-            # synchronous handle job
+    def run_thread(self):
+        for job in self.steps:
             self.handle_job(job)
 
     def handle_job(self, job: Step):
@@ -179,32 +178,29 @@ class ThreadWorker:
     def get_comm_id(self, start_id: int, end_id: int, edge_id: int, batch_id: int):
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
 
+    def send_fw(self, target_rank: int, key: str, value):
+        target_worker = self.workers[target_rank - 1]
+        target_worker.fw_queue.put((key, value))
+
+    def send_bw(self, target_rank: int, key: str, value):
+        target_worker = self.workers[target_rank - 1]
+        target_worker.bw_queue.put((key, value))
+
+    def wait_fw(self, key: str):
+        while key not in self.fw_inputs:
+            (recv_key, recv_value) = self.fw_queue.get()
+            self.fw_inputs[recv_key] = recv_value
+
+    def wait_bw(self, key: str):
+        while key not in self.bw_inputs:
+            (recv_key, recv_value) = self.bw_queue.get()
+            self.bw_inputs[recv_key] = recv_value
+
     def send_act(self, node: PipeNode, batch_id: int):
         curr_rank = node.rank
         curr_id = node.idx
 
-        # TODO: check this requires a lock
         value = self.fw_results[batch_id]
-
-        # check multi rank output
-        same_rank = False
-        diff_rank = False
-        for edge in node.out_edges:
-            for end_node in edge.end_nodes:
-                if end_node.rank != curr_rank:
-                    same_rank = True
-                else:
-                    diff_rank = True
-
-        if same_rank and diff_rank:
-
-            def detach(v):
-                if torch.is_tensor(v) and v.requires_grad:
-                    return v.detach().requires_grad_(True)
-                else:
-                    return v
-
-            value = tree_map(detach, value)
 
         for edge in node.out_edges:
             for end_node in edge.end_nodes:
@@ -304,7 +300,7 @@ class ThreadWorker:
 
         self.fw_results[batch_id] = result
 
-        torch.cuda.current_stream(self.device).synchronize()
+        # torch.cuda.current_stream(self.device).synchronize()
 
     def backward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
@@ -328,4 +324,4 @@ class ThreadWorker:
             grads.append(grad)
 
         torch.autograd.backward(self.fw_results[batch_id], grads)
-        torch.cuda.current_stream(self.device).synchronize()
+        # torch.cuda.current_stream(self.device).synchronize()

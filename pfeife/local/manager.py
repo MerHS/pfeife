@@ -20,10 +20,8 @@ from ..utils import get_logger, get_submodules, move_param_to_callee
 
 # TODO: make it a real tensor
 class PipeTensor:
-    def __init__(self, batch_no, output_token=None, backward_token=None):
+    def __init__(self, batch_no):
         self.batch_no = batch_no
-        self.output_token = output_token
-        self.backward_token = backward_token
 
 
 class PipeGraphRunner(nn.Module):
@@ -48,7 +46,10 @@ class PipeGraphRunner(nn.Module):
         manager.graph = self.graph
 
         mods = get_submodules(gm)
-        mods = [mod.to("cpu") for mod in mods]
+
+        # The graph can be created after the TorchDynamo compiler is activated
+        # Thus, assigning a graph and a scheduler to the workers should be
+        # deferred until this step.
         self.assign_train_steps_to_workers(manager.workers, mods)
 
         input_rank = self.graph.input_node.rank
@@ -88,13 +89,8 @@ class PipeGraphRunner(nn.Module):
                 worker.set_module(mod_id, module)
 
     def forward(self, *args, **kwargs):
-        # TODO: fire workers from here if there is multiple runners
-
-        # return Future[Token]
         batch_no = self.manager.get_batch_no()
-
         self.in_worker.set_input(batch_no, args, kwargs)
-
         return [PipeTensor(batch_no)]
 
 
@@ -133,10 +129,10 @@ class PipeManager:
         self.splitter = ParamSplit()
         self.workers: List[ThreadWorker] = []
 
-        base_time = self.base_time
         for rank in range(1, self.device_cnt + 1):
+            # TODO: configurable device
             device = f"cuda:{rank-1}"
-            worker = ThreadWorker(rank, device, option, base_time)
+            worker = ThreadWorker(rank, device, option, self.base_time)
             self.workers.append(worker)
 
         for worker in self.workers:
@@ -261,21 +257,17 @@ class PipeManager:
         for batch_id, target in enumerate(targets):
             out_worker.set_target(batch_id, target)
 
-        # ignite worker (add jobs to job queue)
-        loops = []
+        # ignite worker
+        threads = []
+        self.debug("Run workers")
         for worker in self.workers:
-            loop = worker.fire()
-            loops.append(loop)
+            t = worker.run()
+            threads.append(t)
 
-        # run and wait tokens
-        # for pt in tokens:
-        #     pt.output_token.wait()
-        #     if pt.backward_token is not None:
-        #         pt.backward_token.wait()
-
-        for loop in loops:
-            loop.wait()
+        for t in threads:
+            t.join()
 
         loss = out_worker.get_loss("sum")
+        self.debug(f"got loss: {loss}")
 
         return loss
