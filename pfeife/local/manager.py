@@ -1,5 +1,6 @@
 import logging
 import time
+from copy import deepcopy
 from typing import List, Union
 
 import torch
@@ -46,6 +47,7 @@ class PipeGraphRunner(nn.Module):
         manager.graph = self.graph
 
         mods = get_submodules(gm)
+        mods = [deepcopy(mod) for mod in mods]
 
         # The graph can be created after the TorchDynamo compiler is activated
         # Thus, assigning a graph and a scheduler to the workers should be
@@ -114,7 +116,7 @@ class PipeManager:
         self._compile()
 
     def __del__(self):
-        for worker in self.clear_workers():
+        for worker in self.workers:
             worker.clear_workers()
 
     def set_option(self, option: PipeOption):
@@ -256,6 +258,9 @@ class PipeManager:
         out_worker = self.workers[out_rank - 1]
         for batch_id, target in enumerate(targets):
             out_worker.set_target(batch_id, target)
+
+        # should we do it once?
+        # dynamo.reset()
 
         # ignite worker
         threads = []

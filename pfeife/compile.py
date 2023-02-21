@@ -1,6 +1,4 @@
 import torch
-from torch._dynamo.optimizations import BACKENDS
-from torch._inductor.compile_fx import compile_fx
 
 
 class WrapperModule(torch.nn.Module):
@@ -21,12 +19,6 @@ class WrapperModule(torch.nn.Module):
 
 
 def compile_module(compiler, submod, args):
-    if compiler == "inductor":
-        torch._inductor.config.triton.cudagraphs = False
-        compiler = compile_fx
-    else:
-        compiler = BACKENDS[compiler]
-
     unwrap_singleton_tuple = False
     for sn in submod.graph.nodes:
         if sn.op == "output":
@@ -35,8 +27,11 @@ def compile_module(compiler, submod, args):
                 sn.args = (sn.args,)
     submod.recompile()
 
+    # fn = torch.compile(submod, backend=compiler)
+    fn = submod
+
     wrapper = WrapperModule(
-        compiler(submod, args),
+        fn,
         unwrap_singleton_tuple,
     )
 

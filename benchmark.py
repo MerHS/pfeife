@@ -13,9 +13,8 @@ from torch.profiler import ProfilerActivity, profile
 from pfeife.local import PipeManager as LocalManager
 from pfeife.rpc import PipeManager as RPCManager, run_master
 from pfeife.loss import SumLoss
-from pfeife.utils import get_logger
+from pfeife.utils import get_logger, set_logger_level
 from pfeife.option import PipeOption
-from pfeife.compile import compile_module
 
 from test.utils import get_model, timed
 
@@ -61,7 +60,7 @@ def run_valid(args, model, inputs, option):
 
     set_seed()
 
-    pipe = PipeManager(model, loss_fn=SumLoss(), option=option)
+    pipe = RPCManager(model, loss_fn=SumLoss(), option=option)
     target = torch.rand(args.batch_size, 10)
     pipe_outputs = pipe.run(target, *inputs)
 
@@ -178,6 +177,8 @@ if __name__ == "__main__":
     )
 
     model_name = args.model
+
+    set_logger_level(option.verbosity)
 
     print(f"================ run {model_name} ================")
 

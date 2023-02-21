@@ -1,5 +1,10 @@
 # Pfeife: Automatic pipeline parallelism powered by TorchDynamo
 
+## Prerequisite
+
+- PyTorch (nightly version >= 2.0)
+- torchbench (see below)
+
 ## Installation
 
 ```sh
