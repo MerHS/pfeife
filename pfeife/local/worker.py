@@ -187,14 +187,22 @@ class ThreadWorker:
         target_worker.bw_queue.put((key, value))
 
     def wait_fw(self, key: str):
+        def map_fw(v):
+            if torch.is_tensor(v):
+                return v.to(device=self.device).detach().requires_grad_(True)
+            else:
+                return v
+
         while key not in self.fw_inputs:
             (recv_key, recv_value) = self.fw_queue.get()
+            recv_value = tree_map(map_fw, recv_value)
             self.fw_inputs[recv_key] = recv_value
 
     def wait_bw(self, key: str):
-        while key not in self.bw_inputs:
+        while key not in self.bw_grads:
             (recv_key, recv_value) = self.bw_queue.get()
-            self.bw_inputs[recv_key] = recv_value
+            recv_value = to_device(recv_value, self.device)
+            self.bw_grads[recv_key] = recv_value
 
     def send_act(self, node: PipeNode, batch_id: int):
         curr_rank = node.rank
@@ -272,7 +280,7 @@ class ThreadWorker:
         for edge in node.in_edges:
             comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             value = self.fw_inputs[comm_id]
-            inputs.append(value)
+            inputs.append(value.clone())
 
         mod = self.mods[curr_id]
 

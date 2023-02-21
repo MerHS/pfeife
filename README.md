@@ -1,5 +1,10 @@
 # Pfeife: Automatic pipeline parallelism powered by TorchDynamo
 
+## Prerequisite
+
+- PyTorch (nightly version >= 2.0)
+- torchbench (see below)
+
 ## Installation
 
 ```sh
@@ -12,9 +17,12 @@ git clone https://github.com/pytorch/benchmark
 cd benchmark
 python install.py
 
-# Run benchmarks 
+# Run benchmarks
 cd ../pfeife
 
-## Single benchmark (VGG16, pipelined with aot_eager compiler)
+## Run benchmark (VGG16, pipelined with aot_eager compiler)
 python benchmark.py --model vgg16 --verbose
+
+## Single process benchmark (run on a local machine)
+python benchmark.py --model vgg16 --single_proc
 ```
