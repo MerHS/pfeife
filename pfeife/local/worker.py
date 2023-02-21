@@ -2,6 +2,7 @@ import logging
 import threading
 import time
 from typing import Dict, List
+from queue import Queue
 
 import torch
 import torch.nn as nn
@@ -10,28 +11,14 @@ import torch.distributed as dist
 from torch.distributed.rpc import PyRRef
 from torch.utils._pytree import tree_map
 
-from .compile import compile_module
-from .option import PipeOption
-from .pipe_graph import PipeGraph, PipeNode
-from .scheduler import Step, StepWork
-from .utils import get_logger, to_device
+from ..compile import compile_module
+from ..option import PipeOption
+from ..pipe_graph import PipeGraph, PipeNode
+from ..scheduler import Step, StepWork
+from ..utils import get_logger, to_device
 
 
-class WorkerSize:
-    def __init__(self, size):
-        self.size = size
-
-
-class WorkerFuture:
-    def __init__(self, fut, buf):
-        self.fut = fut
-        self.buf = buf
-
-    def wait(self):
-        self.fut.wait()
-
-
-class RPCWorker:
+class ThreadWorker:
     def __init__(self, rank: int, device: str, option: PipeOption, base_time=0):
         self.logger = get_logger()
 
@@ -56,7 +43,18 @@ class RPCWorker:
             optim.Adam if option.optimizer_type == "adam" else optim.SGD
         )
 
+        self.fw_lock = threading.Lock()
+        self.bw_lock = threading.Lock()
+
         self.reset_cache()
+
+    def reset_cache(self):
+        self.targets = [None for _ in range(self.option.batch_cnt)]
+        self.losses = [None for _ in range(self.option.batch_cnt)]
+
+        self.fw_inputs = dict()
+        self.fw_results = dict()
+        self.bw_grads = dict()
 
     def _init_optimizer(self):
         if self.optimizer is None:
@@ -64,15 +62,6 @@ class RPCWorker:
                 self.params, **self.option.optimizer_kwargs
             )
         self.optimizer.zero_grad()
-
-    def clear_workers(self):
-        self.workers = []
-
-    def parameters(self):
-        return self.params
-
-    def test_param_and_grad(self):
-        return (self.params[0], self.params[0].grad)
 
     def debug(self, msg):
         t = time.time()
@@ -82,30 +71,17 @@ class RPCWorker:
         t = time.time()
         self.logger.info(f"({t - self.base_time:8.5f})[Worker {self.rank}] {msg}")
 
-    def reset_cache(self):
-        self.targets = [None for _ in range(self.option.batch_cnt)]
-        self.losses = [None for _ in range(self.option.batch_cnt)]
+    def parameters(self):
+        return self.params
 
-        self.fw_results = dict()
-        self.fw_inputs = dict()
-        self.bw_grads = dict()
+    def test_param_and_grad(self):
+        return (self.params[0], self.params[0].grad)
 
-        self.key_tags: Dict[str, int] = dict()
-        self.tag_max = 100
-
-    def add_lock(self, name):
-        lock = threading.Lock()
-        cv = threading.Condition(lock)
-        self.locks[name] = cv
-
-    def get_lock(self, name):
-        return self.locks[name]
+    def clear_workers(self):
+        self.workers = []
 
     def set_workers(self, workers: List[PyRRef]):
         self.workers = workers
-
-    def ping(self, msg):
-        self.debug(f"got {msg} from {self.rank}")
 
     def set_graph(self, pipe_graph: PipeGraph):
         self.graph = pipe_graph
@@ -115,18 +91,6 @@ class RPCWorker:
             for i, step in enumerate(steps):
                 self.debug(f"set step {i}: {step}")
         self.steps = steps
-
-    def fire(self):
-        self.debug(f"activate worker {self.rank} from device {self.device}")
-        self._init_optimizer()
-
-        job_queue = [job for job in self.steps]
-
-        while len(job_queue) > 0:
-            job = job_queue.pop(0)
-
-            # synchronous handle job
-            self.handle_job(job)
 
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
@@ -181,6 +145,18 @@ class RPCWorker:
         self.debug("return loss")
         return loss
 
+    def run(self):
+        self.debug(f"activate worker {self.rank} from device {self.device}")
+        self._init_optimizer()
+
+        job_queue = [job for job in self.steps]
+
+        while len(job_queue) > 0:
+            job = job_queue.pop(0)
+
+            # synchronous handle job
+            self.handle_job(job)
+
     def handle_job(self, job: Step):
         self.debug(f"start {job}")
         node = self.graph.internal_nodes[job.node_id]
@@ -202,119 +178,6 @@ class RPCWorker:
 
     def get_comm_id(self, start_id: int, end_id: int, edge_id: int, batch_id: int):
         return f"comm_{start_id}_{end_id}_{edge_id}_{batch_id}"
-
-    def _send_preproc(self, value):
-        tensor_list = []
-
-        # map tensor to size
-        def to_size(v):
-            nonlocal tensor_list
-            if torch.is_tensor(v):
-                tensor_list.append(v)
-                return WorkerSize(v.size())
-            else:
-                return v
-
-        value_size = tree_map(to_size, value)
-
-        return tensor_list, value_size
-
-    def send_fw(self, rank: int, key: str, value):
-        tensor_list, value_size = self._send_preproc(value)
-
-        # prepare buffer tensor and irecv
-        base_tag = self.tag_max
-        send_ref = self.workers[rank - 1]
-        send_ref.rpc_async().recv_fw_probe(self.rank, base_tag, key, value_size)
-
-        # async send
-        for i, t in enumerate(tensor_list):
-            dist.isend(t, rank, tag=base_tag + i)
-        self.tag_max += len(tensor_list)
-
-    def send_bw(self, rank: int, key: str, value):
-        tensor_list, value_size = self._send_preproc(value)
-
-        # prepare buffer tensor and irecv
-        base_tag = self.tag_max
-        send_ref = self.workers[rank - 1]
-        send_ref.rpc_async().recv_bw_probe(self.rank, base_tag, key, value_size)
-
-        # async send
-        for i, t in enumerate(tensor_list):
-            dist.isend(t, rank, tag=base_tag + i)
-        self.tag_max += len(tensor_list)
-
-    def _recv_probe(self, rank: int, base_tag: int, key: str, value):
-        if key not in self.buffers:
-            self.buffers[key] = []
-
-        buffer = self.buffers[key]
-        tensor_idx = 0
-
-        def to_future(v):
-            nonlocal tensor_idx, buffer
-            if isinstance(v, WorkerSize):
-                if len(buffer) <= tensor_idx:
-                    buffer.append(
-                        torch.empty(v.size, device=self.device, requires_grad=True)
-                    )
-                elif buffer[tensor_idx].size() != v.size:
-                    buffer[tensor_idx] = torch.empty(
-                        v.size, device=self.device, requires_grad=True
-                    )
-                else:
-                    buffer[tensor_idx].grad = None
-
-                buf = buffer[tensor_idx]
-                fut = WorkerFuture(
-                    dist.irecv(buf, rank, tag=base_tag + tensor_idx), buf
-                )
-                tensor_idx += 1
-                return fut
-            else:
-                return v
-
-        fut_value = tree_map(to_future, value)
-
-        return fut_value
-
-    def recv_fw_probe(self, rank: int, base_tag: int, key: str, value):
-        fut = self._recv_probe(rank, base_tag, f"{key}fw", value)
-        self.fw_inputs[key] = fut
-
-    def recv_bw_probe(self, rank: int, base_tag: int, key: str, value):
-        fut = self._recv_probe(rank, base_tag, f"{key}bw", value)
-        self.bw_grads[key] = fut
-
-    def _wait_value(self, future_dict, key: str):
-        # TODO: busy wait?
-        while key not in future_dict:
-            pass
-
-        futures = []
-
-        def get_future(v):
-            nonlocal futures
-            if isinstance(v, WorkerFuture):
-                futures.append(v)
-                return v.buf
-            return v
-
-        value = tree_map(get_future, future_dict[key])
-
-        for f in futures:
-            f.wait()
-
-        future_dict[key] = value
-
-        return value
-
-    def wait_fw(self, key: str):
-        self._wait_value(self.fw_inputs, key)
-
-    def wait_bw(self, key: str):
-        self._wait_value(self.bw_grads, key)
 
     def send_act(self, node: PipeNode, batch_id: int):
         curr_rank = node.rank
