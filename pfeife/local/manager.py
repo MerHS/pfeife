@@ -259,9 +259,6 @@ class PipeManager:
         for batch_id, target in enumerate(targets):
             out_worker.set_target(batch_id, target)
 
-        # should we do it once?
-        # dynamo.reset()
-
         # ignite worker
         threads = []
         self.debug("Run workers")
