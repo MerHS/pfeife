@@ -34,7 +34,8 @@ class PipeGraphRunner(nn.Module):
         super().__init__()
 
         self.manager = manager
-        self.graph = PipeGraph(len(manager.workers), gm)
+        worker_cnt = len(manager.workers)
+        self.graph = PipeGraph(worker_cnt, gm)
         self.sched = manager.scheduler(manager.batch_cnt, self.graph)
         self.workers = manager.workers
 
@@ -120,6 +121,8 @@ class PipeManager:
             worker.clear_workers()
 
     def set_option(self, option: PipeOption):
+        self.debug(f"got option: {option.__dict__}")
+
         self.stage_cnt = option.stage_cnt
         self.batch_cnt = option.batch_cnt
         self.device_cnt = option.device_cnt

@@ -73,7 +73,7 @@ class SchedGPipe(Scheduler):
         batch_cnt = self.batch_cnt
         worker_cnt = graph.worker_cnt
 
-        worker_cnt = min(worker_cnt, node_cnt, batch_cnt)
+        worker_cnt = min(worker_cnt, node_cnt)
 
         # rank: (Step, node_no, microbatch_no)
         sched: List[List[Step]] = []
