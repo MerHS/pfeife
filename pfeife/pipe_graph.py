@@ -5,9 +5,9 @@ from torch.fx import GraphModule, Node
 
 
 class PipeNode:
-    def __init__(self, idx: int, rank: int, is_io=False):
+    def __init__(self, idx: int, rank: int = 0, is_io=False):
         self.idx = idx
-        self.rank = rank  # 0: master/io, 1+: worker
+        self.rank = rank  # 0: unassigned/master, 1+: worker
         self.in_edges: List["PipeEdge"] = []
         self.out_edges: List["PipeEdge"] = []
         self.device = "cpu"
@@ -95,8 +95,7 @@ class PipeGraph:
                 self.input_node.append_out(edge)
             elif node.op == "call_module":  # worker
                 node_cnt += 1
-                rank = (node_cnt // self.worker_cnt) + 1
-                worker = PipeNode(node_cnt, rank)
+                worker = PipeNode(node_cnt)
 
                 self.internal_nodes.append(worker)
                 self.node_dict[node.name] = worker
@@ -146,6 +145,4 @@ class PipeGraph:
             else:
                 print(f"cannot handle {node.op} from PipeGraph")
 
-        self.input_node.rank = self.internal_nodes[0].rank
-        self.output_node.rank = self.internal_nodes[-1].rank
         self.output_node.idx = len(self.internal_nodes) + 1

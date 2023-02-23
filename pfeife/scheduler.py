@@ -42,7 +42,7 @@ class Scheduler:
         self.batch_cnt = batch_cnt
         self.graph = graph
 
-        # self.cluster: list of (indices of assigned node)
+        # self.cluster: list of (node indices for each rank)
         # self.sched: list of List[Step]
         self.cluster, self.sched = self._build_sched()
 
@@ -66,9 +66,12 @@ class SchedGPipe(Scheduler):
     """
 
     def _build_sched(self):
-        node_cnt = len(self.graph.internal_nodes)
+        graph = self.graph
+
+        nodes = graph.internal_nodes
+        node_cnt = len(nodes)
         batch_cnt = self.batch_cnt
-        worker_cnt = self.graph.worker_cnt
+        worker_cnt = graph.worker_cnt
 
         worker_cnt = min(worker_cnt, node_cnt, batch_cnt)
 
@@ -79,9 +82,12 @@ class SchedGPipe(Scheduler):
         cls_len = node_cnt // worker_cnt
         cls_rem = node_cnt % worker_cnt
         start_pos = 0
+
         for i in range(worker_cnt):
             node_worker_len = cls_len + (1 if cls_rem > i else 0)
-            rank_clusters.append(range(start_pos, start_pos + node_worker_len))
+            for node_id in range(start_pos, start_pos + node_worker_len):
+                nodes[i].rank = i + 1
+            rank_clusters.append(list(range(start_pos, start_pos + node_worker_len)))
             start_pos += node_worker_len
 
         # calculate the width of trapozide
@@ -103,6 +109,9 @@ class SchedGPipe(Scheduler):
             rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
 
             sched.append(rank_sched)
+
+        graph.input_node.rank = graph.internal_nodes[0].rank
+        graph.output_node.rank = graph.internal_nodes[-1].rank
 
         return rank_clusters, sched
 
