@@ -44,6 +44,7 @@ class ThreadWorker:
 
         self.fw_queue = Queue()
         self.bw_queue = Queue()
+        self.fw_stream = torch.cuda.Stream(self.device)
 
         self.reset_cache()
 
@@ -161,7 +162,8 @@ class ThreadWorker:
         node = self.graph.internal_nodes[job.node_id]
 
         if job.work == StepWork.SEND_ACT:
-            self.send_act(node, job.batch_id)
+            # self.send_act(node, job.batch_id)
+            pass
         elif job.work == StepWork.RECV_ACT:
             self.recv_act(node, job.batch_id)
         elif job.work == StepWork.FORWARD:
@@ -189,7 +191,7 @@ class ThreadWorker:
     def wait_fw(self, key: str):
         def map_fw(v):
             if torch.is_tensor(v):
-                return v.to(device=self.device).detach().requires_grad_(True)
+                return v.detach().to(device=self.device).requires_grad_(True)
             else:
                 return v
 
@@ -290,25 +292,29 @@ class ThreadWorker:
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)
 
-        result = mod(*inputs)
+        torch.cuda.current_stream().synchronize()
 
-        # TODO: multi-node output node
+        with torch.cuda.stream(self.fw_stream):
+            result = mod(*inputs)
 
-        is_end_node = False
-        for edge in node.out_edges:
-            for out_node in edge.end_nodes:
-                if out_node.is_io:
-                    is_end_node = True
-                    break
-        is_end_node = is_end_node and self.loss_fn is not None
+            # TODO: multi-node output node
 
-        if is_end_node:
-            result = self.loss_fn(result, self.targets[batch_id])
-            self.losses[batch_id] = result
+            is_end_node = False
+            for edge in node.out_edges:
+                for out_node in edge.end_nodes:
+                    if out_node.is_io:
+                        is_end_node = True
+                        break
+            is_end_node = is_end_node and self.loss_fn is not None
 
-        self.fw_results[batch_id] = result
+            if is_end_node:
+                result = self.loss_fn(result, self.targets[batch_id])
+                self.losses[batch_id] = result
 
-        # torch.cuda.current_stream(self.device).synchronize()
+            self.fw_results[batch_id] = result
+
+        self.fw_stream.synchronize()
+        self.send_act(node, batch_id)
 
     def backward(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
