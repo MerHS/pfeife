@@ -3,6 +3,7 @@ import logging
 import os
 import random
 from datetime import datetime
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -99,20 +100,18 @@ def run_valid_local(args, model, inputs, option):
     dynamo.reset()
 
     model.train()
+    local_model = deepcopy(model)
 
-    set_seed()
+    inputs = [torch.rand_like(x) for x in inputs]
+    local_inputs = [x.detach() for x in inputs]
 
     pipe = LocalManager(model, loss_fn=SumLoss(), option=option)
     target = torch.rand(args.batch_size, 10)
     pipe_outputs = pipe.run(target, *inputs)
 
-    set_seed()
-
-    local_inputs = [x.detach().cuda() for x in inputs]
-    model = model.cuda()
-    optim = torch.optim.Adam(model.parameters(), **option.optimizer_kwargs)
+    optim = torch.optim.Adam(local_model.parameters(), **option.optimizer_kwargs)
     optim.zero_grad()
-    cpu_outputs = model(*local_inputs).sum()
+    cpu_outputs = local_model(*local_inputs).sum()
     cpu_outputs.backward()
     optim.step()
 
@@ -120,7 +119,7 @@ def run_valid_local(args, model, inputs, option):
     print(f"first vanilla output (sum): {cpu_outputs}")
 
     pipe_param, pipe_grad = pipe.workers[0].test_param_and_grad()
-    cpu_param = list(model.parameters())[0]
+    cpu_param = list(local_model.parameters())[0]
 
     print(f"pipe param[0]: {pipe_param.reshape(-1)[:5]}")
     print(f"vanilla param[0]: {cpu_param.reshape(-1)[:5]}")
@@ -128,11 +127,12 @@ def run_valid_local(args, model, inputs, option):
     print(f"pipe param[0] grad: {pipe_grad.reshape(-1)[:5]}")
     print(f"vanilla param[0] grad: {cpu_param.grad.reshape(-1)[:5]}")
 
-    set_seed()
-    pipe_outputs2 = pipe.run(target, *inputs)
+    inputs = [torch.rand_like(x) for x in inputs]
+    local_inputs = [x.detach() for x in inputs]
 
-    set_seed()
-    cpu_outputs2 = model(*local_inputs).sum()
+    pipe_outputs2 = pipe.run(target, *inputs)
+    cpu_outputs2 = local_model(*local_inputs).sum()
+
     print(f"second pipe output (sum): {pipe_outputs2}")
     print(f"second vanilla output (sum): {cpu_outputs2}")
 
