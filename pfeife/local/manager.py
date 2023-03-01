@@ -39,12 +39,6 @@ class PipeGraphRunner(nn.Module):
         self.sched = manager.scheduler(manager.batch_cnt, self.graph)
         self.workers = manager.workers
 
-        logger = get_logger()
-        if logger.isEnabledFor(logging.DEBUG):
-            graph_str = self.graph.to_str()
-            logger.debug("=====pipeline graph======")
-            logger.debug("\n" + graph_str)
-
         manager.graph = self.graph
 
         mods = get_submodules(gm)
@@ -54,6 +48,12 @@ class PipeGraphRunner(nn.Module):
         # Thus, assigning a graph and a scheduler to the workers should be
         # deferred until this step.
         self.assign_train_steps_to_workers(manager.workers, mods)
+
+        logger = get_logger()
+        if logger.isEnabledFor(logging.DEBUG):
+            graph_str = self.graph.to_str()
+            logger.debug("=====pipeline graph======")
+            logger.debug("\n" + graph_str)
 
         input_rank = self.graph.input_node.rank
         output_rank = self.graph.output_node.rank
@@ -67,29 +67,22 @@ class PipeGraphRunner(nn.Module):
     ):
         sched = self.sched
         graph = self.graph
-        rank_clusters = sched.cluster
 
-        devices = []
-        for worker_id, cluster in enumerate(rank_clusters):
-            worker = workers[worker_id]
-            worker_device = worker.get_device()
-            devices.append(worker_device)
+        for node in graph.internal_nodes:
+            worker = workers[node.rank - 1]
+            node.device = worker.device
 
-            for node_id in cluster:
-                node = graph.internal_nodes[node_id]
-                node.device = worker_device
+            module = modules[node.idx - 1]
+            worker.set_module(node.idx, module)
 
         input_node = graph.input_node
-        input_node.device = devices[input_node.rank - 1]
+        input_node.device = workers[input_node.rank - 1].device
         output_node = graph.output_node
-        output_node.device = devices[output_node.rank - 1]
+        output_node.device = workers[output_node.rank - 1].device
 
-        for worker_id, (worker, cluster) in enumerate(zip(workers, rank_clusters)):
+        for worker_id, worker in enumerate(workers):
             worker.set_graph(graph)
             worker.set_scheduler_steps(sched.get_train_steps(worker_id))
-            for mod_id in cluster:
-                module = modules[mod_id]
-                worker.set_module(mod_id, module)
 
     def forward(self, *args, **kwargs):
         batch_no = self.manager.get_batch_no()
