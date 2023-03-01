@@ -2,9 +2,7 @@ from typing import List, Tuple
 from enum import Enum
 from dataclasses import dataclass
 
-import torch
-from torch.distributed.rpc import PyRRef
-
+from .utils import get_logger
 from .pipe_graph import PipeGraph
 
 
@@ -44,7 +42,7 @@ class Scheduler:
 
         # self.cluster: list of (node indices for each rank)
         # self.sched: list of List[Step]
-        self.cluster, self.sched = self._build_sched()
+        self.sched = self._build_sched()
 
     def _build_sched(self):
         # returns node clusters and steps
@@ -86,7 +84,7 @@ class SchedGPipe(Scheduler):
         for i in range(worker_cnt):
             node_worker_len = cls_len + (1 if cls_rem > i else 0)
             for node_id in range(start_pos, start_pos + node_worker_len):
-                nodes[i].rank = i + 1
+                nodes[node_id].rank = i + 1
             rank_clusters.append(list(range(start_pos, start_pos + node_worker_len)))
             start_pos += node_worker_len
 
@@ -113,11 +111,71 @@ class SchedGPipe(Scheduler):
         graph.input_node.rank = graph.internal_nodes[0].rank
         graph.output_node.rank = graph.internal_nodes[-1].rank
 
+        return sched
+
+
+class Sched1F1B(Scheduler):
+    """
+    Equally slice the list of nodes into #worker pieces
+    """
+
+    def _build_sched(self):
+        graph = self.graph
+
+        nodes = graph.internal_nodes
+        node_cnt = len(nodes)
+        batch_cnt = self.batch_cnt
+        worker_cnt = graph.worker_cnt
+
+        worker_cnt = min(worker_cnt, node_cnt)
+
+        # rank: (Step, node_no, microbatch_no)
+        sched: List[List[Step]] = []
+
+        rank_clusters = []
+        cls_len = node_cnt // worker_cnt
+        cls_rem = node_cnt % worker_cnt
+        start_pos = 0
+
+        for i in range(worker_cnt):
+            node_worker_len = cls_len + (1 if cls_rem > i else 0)
+            for node_id in range(start_pos, start_pos + node_worker_len):
+                nodes[node_id].rank = i + 1
+            rank_clusters.append(list(range(start_pos, start_pos + node_worker_len)))
+            start_pos += node_worker_len
+
+        for cluster in rank_clusters:
+            rank_sched: List[Step] = []
+
+            for batch_id in range(batch_cnt):
+                for node_id in cluster:
+                    rank_sched.append(Step(StepWork.RECV_ACT, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.FORWARD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.SEND_ACT, node_id, batch_id))
+
+            for batch_id in reversed(range(batch_cnt)):
+                for node_id in reversed(cluster):
+                    rank_sched.append(Step(StepWork.RECV_GRAD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.BACKWARD, node_id, batch_id))
+                    rank_sched.append(Step(StepWork.SEND_GRAD, node_id, batch_id))
+
+            rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
+
+            sched.append(rank_sched)
+
+        graph.input_node.rank = graph.internal_nodes[0].rank
+        graph.output_node.rank = graph.internal_nodes[-1].rank
+
         return rank_clusters, sched
 
 
+_SCHED_MAP = {"gpipe": SchedGPipe, "1f1b": Sched1F1B}
+
+
 def get_scheduler(sched_name: str = "gpipe"):
-    if sched_name == "gpipe":
-        return SchedGPipe
+    name = sched_name.lower()
+
+    if name in _SCHED_MAP:
+        return _SCHED_MAP[name]
     else:
         raise NameError(f"Unknown scheduler: {sched_name}")
