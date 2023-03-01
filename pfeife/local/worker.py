@@ -292,28 +292,24 @@ class ThreadWorker:
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)
 
-        torch.cuda.current_stream().synchronize()
+        result = mod(*inputs)
 
-        with torch.cuda.stream(self.fw_stream):
-            result = mod(*inputs)
+        # TODO: multi-node output node
 
-            # TODO: multi-node output node
+        is_end_node = False
+        for edge in node.out_edges:
+            for out_node in edge.end_nodes:
+                if out_node.is_io:
+                    is_end_node = True
+                    break
+        is_end_node = is_end_node and self.loss_fn is not None
 
-            is_end_node = False
-            for edge in node.out_edges:
-                for out_node in edge.end_nodes:
-                    if out_node.is_io:
-                        is_end_node = True
-                        break
-            is_end_node = is_end_node and self.loss_fn is not None
+        if is_end_node:
+            result = self.loss_fn(result, self.targets[batch_id])
+            self.losses[batch_id] = result
 
-            if is_end_node:
-                result = self.loss_fn(result, self.targets[batch_id])
-                self.losses[batch_id] = result
+        self.fw_results[batch_id] = result
 
-            self.fw_results[batch_id] = result
-
-        self.fw_stream.synchronize()
         self.send_act(node, batch_id)
 
     def backward(self, node: PipeNode, batch_id: int):
