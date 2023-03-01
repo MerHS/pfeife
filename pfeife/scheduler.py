@@ -169,7 +169,7 @@ class Sched1F1B(Scheduler):
                     self._add_backward(rank_sched, cluster, batch_id)
             else:
                 for batch_id in range(batch_cnt + worker_cnt - 1):
-                    if batch_id < worker_cnt:
+                    if batch_id < batch_cnt:
                         self._add_forward(rank_sched, cluster, batch_id)
                     if batch_id >= (worker_cnt - 1):
                         self._add_backward(
