@@ -141,10 +141,10 @@ def run_model(args, model, inputs, option):
     dynamo.reset()
 
     if not args.no_pipe:
-        if args.single_proc:
-            model = LocalManager(model, loss_fn=SumLoss(), option=option)
-        else:
+        if args.rpc:
             model = RPCManager(model, loss_fn=SumLoss(), option=option)
+        else:
+            model = LocalManager(model, loss_fn=SumLoss(), option=option)
 
         def model_iter_fn(model, example_inputs, collect_outputs=False):
             target = torch.rand(args.batch_size, 10)
@@ -191,7 +191,7 @@ if __name__ == "__main__":
         help="if set to a str, uses dynamo[str] backend. else, aot_eager",
     )
     parser.add_argument("--no_pipe", action="store_true")
-    parser.add_argument("--single_proc", action="store_true")
+    parser.add_argument("--rpc", action="store_true")
     parser.add_argument("--scheduler", default="gpipe")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -233,11 +233,11 @@ if __name__ == "__main__":
         args.batch_size = inputs[0].shape[0]
 
     if args.check_valid:
-        if args.single_proc:
-            run_valid_local(args, model, inputs, option)
-        else:
+        if args.rpc:
             run_master(run_valid_rpc, args=(args, model, inputs, option), option=option)
-    elif args.no_pipe or args.single_proc:
-        run_model(args, model, inputs, option)
-    else:
+        else:
+            run_valid_local(args, model, inputs, option)
+    elif args.rpc:
         run_master(run_model, args=(args, model, inputs, option), option=option)
+    else:
+        run_model(args, model, inputs, option)
