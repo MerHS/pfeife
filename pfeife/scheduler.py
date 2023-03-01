@@ -57,6 +57,28 @@ class Scheduler:
         # TODO: implement it
         pass
 
+    def _add_forward(self, rank_sched: List[Step], node_ids, batch_id):
+        if isinstance(node_ids, int):
+            node_ids = [node_ids]
+
+        for node_id in node_ids:
+            rank_sched.append(Step(StepWork.RECV_ACT, node_id, batch_id))
+            rank_sched.append(Step(StepWork.FORWARD, node_id, batch_id))
+            rank_sched.append(Step(StepWork.SEND_ACT, node_id, batch_id))
+
+        return rank_sched
+
+    def _add_backward(self, rank_sched: List[Step], node_ids, batch_id):
+        if isinstance(node_ids, int):
+            node_ids = [node_ids]
+
+        for node_id in node_ids:
+            rank_sched.append(Step(StepWork.RECV_GRAD, node_id, batch_id))
+            rank_sched.append(Step(StepWork.BACKWARD, node_id, batch_id))
+            rank_sched.append(Step(StepWork.SEND_GRAD, node_id, batch_id))
+
+        return rank_sched
+
 
 class SchedGPipe(Scheduler):
     """
@@ -93,16 +115,10 @@ class SchedGPipe(Scheduler):
             rank_sched: List[Step] = []
 
             for batch_id in range(batch_cnt):
-                for node_id in cluster:
-                    rank_sched.append(Step(StepWork.RECV_ACT, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.FORWARD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.SEND_ACT, node_id, batch_id))
+                self._add_forward(rank_sched, cluster, batch_id)
 
             for batch_id in reversed(range(batch_cnt)):
-                for node_id in reversed(cluster):
-                    rank_sched.append(Step(StepWork.RECV_GRAD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.BACKWARD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.SEND_GRAD, node_id, batch_id))
+                self._add_backward(rank_sched, reversed(cluster), batch_id)
 
             rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
 
@@ -144,20 +160,21 @@ class Sched1F1B(Scheduler):
             rank_clusters.append(list(range(start_pos, start_pos + node_worker_len)))
             start_pos += node_worker_len
 
-        for cluster in rank_clusters:
+        for worker_id, cluster in enumerate(rank_clusters):
             rank_sched: List[Step] = []
 
-            for batch_id in range(batch_cnt):
-                for node_id in cluster:
-                    rank_sched.append(Step(StepWork.RECV_ACT, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.FORWARD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.SEND_ACT, node_id, batch_id))
-
-            for batch_id in reversed(range(batch_cnt)):
-                for node_id in reversed(cluster):
-                    rank_sched.append(Step(StepWork.RECV_GRAD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.BACKWARD, node_id, batch_id))
-                    rank_sched.append(Step(StepWork.SEND_GRAD, node_id, batch_id))
+            if worker_id == worker_cnt - 1:
+                for batch_id in range(batch_cnt):
+                    self._add_forward(rank_sched, cluster, batch_id)
+                    self._add_backward(rank_sched, cluster, batch_id)
+            else:
+                for batch_id in range(batch_cnt + worker_cnt - 1):
+                    if batch_id < worker_cnt:
+                        self._add_forward(rank_sched, cluster, batch_id)
+                    if batch_id >= (worker_cnt - 1):
+                        self._add_backward(
+                            rank_sched, cluster, batch_id - (worker_cnt - 1)
+                        )
 
             rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
 
@@ -166,7 +183,7 @@ class Sched1F1B(Scheduler):
         graph.input_node.rank = graph.internal_nodes[0].rank
         graph.output_node.rank = graph.internal_nodes[-1].rank
 
-        return rank_clusters, sched
+        return sched
 
 
 _SCHED_MAP = {"gpipe": SchedGPipe, "1f1b": Sched1F1B}
