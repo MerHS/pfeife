@@ -7,7 +7,6 @@ from queue import Queue
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.futures import Future
 from torch.utils._pytree import tree_map
 
 from ..compile import compile_module
@@ -43,10 +42,15 @@ class ThreadWorker:
         )
 
         self.fw_req_queue = Queue()
+        self.fw_send_queue = Queue()
         self.fw_queue = Queue()
-        self.bw_req_queue = Queue()
         self.bw_queue = Queue()
         self.fw_stream = torch.cuda.Stream(self.device)
+        self.send_stream = torch.cuda.Stream(self.device)
+
+        # TODO: replace permanent thread
+        self.send_thread = threading.Thread(target=self._send_thread, daemon=True)
+        self.send_thread.start()
 
         self.reset_cache()
 
@@ -149,23 +153,57 @@ class ThreadWorker:
     def run(self):
         self.debug(f"activate worker {self.rank} from device {self.device}")
         self._init_optimizer()
+        torch.cuda.current_stream().synchronize()
 
-        self.thread = threading.Thread(target=self.run_thread, daemon=True)
-        self.thread.start()
-        return self.thread
+        self.worker_thread = threading.Thread(target=self._handle_thread, daemon=True)
+        self.worker_thread.start()
+        return self.worker_thread
 
-    def run_thread(self):
+    def _handle_thread(self):
         for job in self.steps:
             self.handle_job(job)
+
+    def _send_thread(self):
+        while True:
+            event, node, payloads = self.fw_send_queue.get()
+
+            curr_rank = node.rank
+            event.synchronize()
+            event.wait(self.send_stream)
+
+            moved_payloads = []
+            with torch.cuda.stream(self.send_stream):
+                for end_rank, comm_id, value_send in payloads:
+
+                    def detach(v):
+                        if torch.is_tensor(v):
+                            return (
+                                v.to(device=self.workers[end_rank - 1].device)
+                                .detach()
+                                .requires_grad_(True)
+                            )
+                        else:
+                            return v
+
+                    value_send = tree_map(detach, value_send)
+                    moved_payloads.append((end_rank, comm_id, value_send))
+
+            self.send_stream.synchronize()
+
+            for end_rank, comm_id, value_send in moved_payloads:
+                if end_rank == curr_rank:
+                    self.fw_inputs[comm_id] = value_send
+                else:
+                    self._send_fw(end_rank, comm_id, value_send)
 
     def handle_job(self, job: Step):
         self.debug(f"start {job}")
         node = self.graph.internal_nodes[job.node_id]
 
         if job.work == StepWork.SEND_ACT:
-            self.send_act(node, job.batch_id)
+            self.send_act_async(node, job.batch_id)
         elif job.work == StepWork.RECV_ACT:
-            self.recv_act(node, job.batch_id)
+            self.recv_act_async(node, job.batch_id)
         elif job.work == StepWork.FORWARD:
             self.forward(node, job.batch_id)
         elif job.work == StepWork.SEND_GRAD:
@@ -183,15 +221,11 @@ class ThreadWorker:
     def get_result_id(self, node_id: int, batch_id: int):
         return f"result_{node_id}_{batch_id}"
 
-    def send_fw(self, target_rank: int, key: str, value):
+    def _send_fw(self, target_rank: int, key: str, value):
         target_worker = self.workers[target_rank - 1]
         target_worker.fw_queue.put((key, value))
 
-    def send_bw(self, target_rank: int, key: str, value):
-        target_worker = self.workers[target_rank - 1]
-        target_worker.bw_queue.put((key, value))
-
-    def send_act(self, node: PipeNode, batch_id: int):
+    def send_act_sync(self, node: PipeNode, batch_id: int):
         curr_rank = node.rank
         curr_id = node.idx
 
@@ -202,10 +236,6 @@ class ThreadWorker:
         for edge in node.out_edges:
             for end_node in edge.end_nodes:
                 comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
-
-                self.debug(
-                    f"<SEND_ACT> send to id {comm_id} (node: {end_node.idx} / rank: {end_node.rank})"
-                )
 
                 if edge.idx is not None:
                     value_send = value[edge.idx]
@@ -240,31 +270,69 @@ class ThreadWorker:
 
         # send and detach
         for end_rank, comm_id, value_send in moved_payloads:
-            if end_node.rank == curr_rank:
+            if end_rank == curr_rank:
                 self.fw_inputs[comm_id] = value_send
             else:
-                self.send_fw(end_rank, comm_id, value_send)
+                self._send_fw(end_rank, comm_id, value_send)
 
-    def req_fw(self, sender_rank: int, key: str):
+    def send_act_async(self, node: PipeNode, batch_id: int):
+        event = torch.cuda.Event(blocking=True)
+        event.record(self.fw_stream)
+
+        curr_id = node.idx
+
+        result_id = self.get_result_id(node.idx, batch_id)
+        value = self.fw_results[result_id]
+
+        payloads = []
+        for edge in node.out_edges:
+            for end_node in edge.end_nodes:
+                comm_id = self.get_comm_id(curr_id, end_node.idx, edge.idx, batch_id)
+
+                if edge.idx is not None:
+                    value_send = value[edge.idx]
+                else:
+                    value_send = value
+
+                payloads.append((end_node.rank, comm_id, value_send))
+
+        self.fw_send_queue.put((event, node, payloads))
+
+    def _req_fw(self, sender_rank: int, key: str):
         sender = self.workers[sender_rank - 1]
         sender.fw_req_queue.put(key)
 
-    def wait_fw(self, key: str):
+    def _wait_fw(self, key: str):
         while key not in self.fw_inputs:
             (recv_key, recv_value) = self.fw_queue.get()
             self.fw_inputs[recv_key] = recv_value
 
-    def recv_act(self, node: PipeNode, batch_id: int):
+    def recv_act_sync(self, node: PipeNode, batch_id: int):
         curr_id = node.idx
 
         input_keys = []
         for edge in node.in_edges:
             comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
-            self.req_fw(edge.start_node.rank, comm_id)
+            self._req_fw(edge.start_node.rank, comm_id)
             input_keys.append(comm_id)
 
         for key in input_keys:
-            self.wait_fw(key)
+            self._wait_fw(key)
+
+    def recv_act_async(self, node: PipeNode, batch_id: int):
+        curr_id = node.idx
+
+        input_keys = []
+        for edge in node.in_edges:
+            comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
+            input_keys.append(comm_id)
+
+        for key in input_keys:
+            self._wait_fw(key)
+
+    def _send_bw(self, target_rank: int, key: str, value):
+        target_worker = self.workers[target_rank - 1]
+        target_worker.bw_queue.put((key, value))
 
     def send_grad(self, node: PipeNode, batch_id: int):
         curr_rank = node.rank
@@ -280,9 +348,9 @@ class ThreadWorker:
             if start_node.rank == curr_rank:
                 self.bw_grads[comm_id] = value
             else:
-                self.send_bw(start_node.rank, comm_id, value)
+                self._send_bw(start_node.rank, comm_id, value)
 
-    def wait_bw(self, key: str):
+    def _wait_bw(self, key: str):
         while key not in self.bw_grads:
             (recv_key, recv_value) = self.bw_queue.get()
             recv_value = to_device(recv_value, self.device)
@@ -300,11 +368,12 @@ class ThreadWorker:
                 grad_keys.append(comm_id)
 
         for key in grad_keys:
-            self.wait_bw(key)
+            self._wait_bw(key)
 
     def optimizer_step(self, node: PipeNode, batch_id: int):
         self.optimizer.step()
         torch.cuda.current_stream(self.device).synchronize()
+        self.fw_stream.synchronize()
         self.debug("optimizer end")
 
     def forward(self, node: PipeNode, batch_id: int):
@@ -313,7 +382,8 @@ class ThreadWorker:
         for edge in node.in_edges:
             comm_id = self.get_comm_id(edge.start_node.idx, curr_id, edge.idx, batch_id)
             value = self.fw_inputs[comm_id]
-            inputs.append(value.clone())
+            with torch.cuda.stream(self.fw_stream):
+                inputs.append(value.clone())
 
         mod = self.mods[curr_id]
 
@@ -323,7 +393,8 @@ class ThreadWorker:
             self.mods[curr_id] = mod
             self.mod_compiled.add(curr_id)
 
-        result = mod(*inputs)
+        with torch.cuda.stream(self.fw_stream):
+            result = mod(*inputs)
 
         # TODO: multi-node output node
 
@@ -336,8 +407,9 @@ class ThreadWorker:
         is_end_node = is_end_node and self.loss_fn is not None
 
         if is_end_node:
-            result = self.loss_fn(result, self.targets[batch_id])
-            self.losses[batch_id] = result
+            with torch.cuda.stream(self.fw_stream):
+                result = self.loss_fn(result, self.targets[batch_id])
+                self.losses[batch_id] = result
 
         result_id = self.get_result_id(node.idx, batch_id)
         self.fw_results[result_id] = result
