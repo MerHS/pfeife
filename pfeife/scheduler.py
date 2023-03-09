@@ -169,7 +169,7 @@ class Sched1F1B(Scheduler):
                     self._add_backward(rank_sched, cluster, batch_id)
             else:
                 # warmup forward
-                for batch_id in range(worker_cnt):
+                for batch_id in range(worker_cnt - worker_id):
                     self._add_forward(rank_sched, cluster, batch_id)
 
                 for bw_batch_id in range(batch_cnt):
@@ -177,7 +177,7 @@ class Sched1F1B(Scheduler):
 
                     fw_batch_id = bw_batch_id + worker_cnt - worker_id
 
-                    if worker_cnt <= fw_batch_id < batch_cnt:
+                    if fw_batch_id < batch_cnt:
                         self._add_forward(rank_sched, cluster, fw_batch_id)
 
             rank_sched.append(Step(StepWork.OPTIMIZER_STEP, -1, -1))
