@@ -78,8 +78,8 @@ declare -a MODELS=(
     # pytorch_stargan # no custom batch size
     pytorch_unet # O
     resnet152 # O
-    resnet18 # O 
-    resnet50 # O 
+    resnet18 # O
+    resnet50 # O
     # resnet50_quantized_qat # skip quant model
     resnext50_32x4d # O
     # sam # untrainable
@@ -112,7 +112,7 @@ declare -a MODELS=(
 # Iterate the string array using for loop
 cd ../pfeife
 for val in ${MODELS[@]}; do
-    python mp_launch.py --world_size 2 benchmark_partial.py \
+    python mp_launch.py --world_size 2 benchmark_mp.py \
       --device_cnt=2 --batch_size=1 --batch_cnt=2 --repeat=2 \
       --model=$val --loop_cnt=1 --prefetch_fwd=0 --no_bench_optimizer \
       --device_bench profile/stable-nccl-dev2.bench --check_valid

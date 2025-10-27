@@ -183,7 +183,7 @@ You can also use memcpy version rather than NCCL communication (memcpy is slight
 If you run a benchmark, you will see the result like below.
 
 ```
-> python mp_launch.py --world_size 2 benchmark_partial.py --device_cnt=2 --batch_size=4 --batch_cnt=3 --repeat=2 --model=timm_vision_transformer_large --loop_cnt=1 --prefetch_fwd=0 --device_bench profile/stable-nccl-dev4.bench
+> python mp_launch.py --world_size 2 benchmark_mp.py --device_cnt=2 --batch_size=4 --batch_cnt=3 --repeat=2 --model=timm_vision_transformer_large --loop_cnt=1 --prefetch_fwd=0 --device_bench profile/stable-nccl-dev4.bench
 
 ================ run timm_vision_transformer_large ================
 forward: 136.6731 ms, backward: 290.7007 ms
